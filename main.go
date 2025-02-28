@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -23,6 +25,8 @@ type Client struct {
 	httpClient *retryablehttp.Client
 	baseURL    string
 	token      string
+	verbose    bool
+	logger     *log.Logger
 }
 
 type AccessTokenResponse struct {
@@ -54,16 +58,29 @@ type ErrorResponse struct {
 	Details []string `json:"details"`
 }
 
-func newClient() (*Client, error) {
+func newClient(verbose bool) (*Client, error) {
 	retryClient := retryablehttp.NewClient()
 	retryClient.HTTPClient = cleanhttp.DefaultClient()
 	retryClient.RetryMax = 3
-	retryClient.Logger = nil // Disable logging
+
+	logger := log.New(io.Discard, "", 0)
+	if verbose {
+		logger = log.New(os.Stderr, "vault-secret-agent: ", log.Ltime)
+	}
+	retryClient.Logger = logger
 
 	return &Client{
 		httpClient: retryClient,
 		baseURL:    hcpAPIBaseURL,
+		verbose:    verbose,
+		logger:     logger,
 	}, nil
+}
+
+func (c *Client) logf(format string, v ...interface{}) {
+	if c.verbose {
+		c.logger.Printf(format, v...)
+	}
 }
 
 func (c *Client) getAccessToken() error {
@@ -74,6 +91,7 @@ func (c *Client) getAccessToken() error {
 		return fmt.Errorf("HCP_CLIENT_ID and HCP_CLIENT_SECRET must be set")
 	}
 
+	c.logf("Getting access token from HCP auth service...")
 	data := strings.NewReader("grant_type=client_credentials&audience=https://api.hashicorp.cloud")
 	req, err := retryablehttp.NewRequest(http.MethodPost, authURL, data)
 	if err != nil {
@@ -100,10 +118,12 @@ func (c *Client) getAccessToken() error {
 	}
 
 	c.token = tokenResp.AccessToken
+	c.logf("Successfully obtained access token")
 	return nil
 }
 
 func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error) {
+	c.logf("Making request to %s %s", req.Method, req.URL.String())
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -111,11 +131,13 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 
 	// If we get an authentication error, try to refresh the token and retry once
 	if resp.StatusCode == http.StatusUnauthorized {
+		c.logf("Received unauthorized response, refreshing token...")
 		resp.Body.Close()
 		if err := c.getAccessToken(); err != nil {
 			return nil, fmt.Errorf("failed to refresh token: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
+		c.logf("Retrying request with new token...")
 		return c.httpClient.Do(req)
 	}
 
@@ -131,6 +153,7 @@ func (c *Client) getSecret(ctx context.Context, secretName string) (*SecretRespo
 		return nil, fmt.Errorf("HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set")
 	}
 
+	c.logf("Fetching secret %q from HCP Vault Secrets...", secretName)
 	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
 		c.baseURL, orgID, projectID, appName, secretName)
 
@@ -161,17 +184,22 @@ func (c *Client) getSecret(ctx context.Context, secretName string) (*SecretRespo
 		return nil, fmt.Errorf("failed to decode secret response: %w", err)
 	}
 
+	c.logf("Successfully retrieved secret %q (version %d)", secretName, secretResp.Secret.LatestVersion)
 	return &secretResp, nil
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <secret-name>\n", os.Args[0])
+	verbose := flag.Bool("verbose", false, "Enable verbose logging")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) != 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--verbose] <secret-name>\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	secretName := os.Args[1]
-	client, err := newClient()
+	secretName := args[0]
+	client, err := newClient(*verbose)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating client: %v\n", err)
 		os.Exit(1)

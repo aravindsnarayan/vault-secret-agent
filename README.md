@@ -8,6 +8,7 @@ A command-line tool that fetches secrets from HCP Vault Secrets, similar to vaul
 - Automatic token refresh
 - Retryable HTTP client with error handling
 - Simple CLI interface
+- Verbose logging option for debugging
 
 ## Prerequisites
 
@@ -46,9 +47,18 @@ export HCP_APP_NAME="your-app-name"
 
 # Fetch a secret
 ./vault-secret-agent SECRET_NAME
+
+# Fetch a secret with verbose logging
+./vault-secret-agent --verbose SECRET_NAME
 ```
 
 The tool will output the secret value to stdout, making it easy to use in scripts or other automation tools.
+
+When using the `--verbose` flag, the tool will output detailed information about:
+- Authentication process
+- API requests and responses
+- Token refresh attempts
+- Secret retrieval status
 
 ## Error Handling
 
