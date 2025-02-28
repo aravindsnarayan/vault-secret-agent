@@ -4,7 +4,8 @@ A command-line tool that fetches secrets from HCP Vault Secrets, similar to vaul
 
 ## Features
 
-- Fetch secrets from HCP Vault Secrets using the latest API (2023-11-28)
+- Fetch one or more secrets from HCP Vault Secrets using the latest API (2023-11-28)
+- Concurrent fetching of multiple secrets
 - Automatic token refresh
 - Retryable HTTP client with error handling
 - Simple CLI interface
@@ -45,17 +46,20 @@ export HCP_ORGANIZATION_ID="your-org-id"
 export HCP_PROJECT_ID="your-project-id"
 export HCP_APP_NAME="your-app-name"
 
-# Fetch a secret
+# Fetch a single secret
 ./vault-secret-agent SECRET_NAME
 
-# Fetch a secret with verbose logging
-./vault-secret-agent --verbose SECRET_NAME
+# Fetch multiple secrets
+./vault-secret-agent SECRET1 SECRET2 SECRET3
 
-# Fetch a secret with full JSON output
-./vault-secret-agent --json SECRET_NAME
+# Fetch multiple secrets with verbose logging
+./vault-secret-agent --verbose SECRET1 SECRET2 SECRET3
+
+# Fetch multiple secrets with full JSON output
+./vault-secret-agent --json SECRET1 SECRET2 SECRET3
 ```
 
-The tool will output the secret value to stdout, making it easy to use in scripts or other automation tools.
+The tool will output the secret values to stdout in `KEY=VALUE` format, making it easy to use in scripts or other automation tools. When fetching multiple secrets, each secret is fetched concurrently for better performance.
 
 When using the `--verbose` flag, the tool will output detailed information about:
 - Authentication process
@@ -63,7 +67,33 @@ When using the `--verbose` flag, the tool will output detailed information about
 - Token refresh attempts
 - Secret retrieval status
 
-When using the `--json` flag, the tool will output the full JSON response from HCP Vault Secrets instead of just the secret value.
+When using the `--json` flag, the tool will output the full JSON response from HCP Vault Secrets, with secrets organized by name.
+
+### Output Formats
+
+Default output (KEY=VALUE):
+```bash
+SECRET1=value1
+SECRET2=value2
+SECRET3=value3
+```
+
+JSON output (with --json flag):
+```json
+{
+  "SECRET1": {
+    "secret": {
+      "name": "SECRET1",
+      "type": "kv",
+      "latest_version": 1,
+      ...
+    }
+  },
+  "SECRET2": {
+    ...
+  }
+}
+```
 
 ## Error Handling
 

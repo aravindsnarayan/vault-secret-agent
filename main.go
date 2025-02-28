@@ -111,6 +111,13 @@ type ErrorResponse struct {
 	Details []string `json:"details"`
 }
 
+type SecretResult struct {
+	Name     string
+	Value    string
+	Error    error
+	Response *SecretResponse
+}
+
 func newClient(verbose bool) (*Client, error) {
 	retryClient := retryablehttp.NewClient()
 	retryClient.HTTPClient = cleanhttp.DefaultClient()
@@ -245,18 +252,52 @@ func (c *Client) getSecret(ctx context.Context, secretName string) (*SecretRespo
 	return &secretResp, nil
 }
 
+func (c *Client) getSecrets(ctx context.Context, secretNames []string) []SecretResult {
+	results := make([]SecretResult, len(secretNames))
+	resultChan := make(chan SecretResult, len(secretNames))
+
+	// Create a goroutine for each secret
+	for _, name := range secretNames {
+		go func(secretName string) {
+			result := SecretResult{Name: secretName}
+			resp, err := c.getSecret(ctx, secretName)
+			if err != nil {
+				result.Error = err
+			} else {
+				result.Value = resp.Secret.StaticVersion.Value
+				result.Response = resp
+			}
+			resultChan <- result
+		}(name)
+	}
+
+	// Collect results
+	for i := 0; i < len(secretNames); i++ {
+		result := <-resultChan
+		// Find the correct position in results slice
+		for j := range secretNames {
+			if secretNames[j] == result.Name {
+				results[j] = result
+				break
+			}
+		}
+	}
+
+	return results
+}
+
 func main() {
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	jsonOutput := flag.Bool("json", false, "Output full JSON response")
 	flag.Parse()
 
 	args := flag.Args()
-	if len(args) != 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [--verbose] [--json] <secret-name>\n", os.Args[0])
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--verbose] [--json] <secret-name>...\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	secretName := args[0]
+	secretNames := args
 	client, err := newClient(*verbose)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating client: %v\n", err)
@@ -269,22 +310,42 @@ func main() {
 	}
 
 	ctx := context.Background()
-	secretResp, err := client.getSecret(ctx, secretName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting secret: %v\n", err)
-		os.Exit(1)
+	results := client.getSecrets(ctx, secretNames)
+
+	// Check if any errors occurred
+	hasErrors := false
+	for _, result := range results {
+		if result.Error != nil {
+			hasErrors = true
+			fmt.Fprintf(os.Stderr, "Error getting secret %q: %v\n", result.Name, result.Error)
+		}
 	}
 
 	if *jsonOutput {
+		// Create a map for JSON output
+		output := make(map[string]interface{})
+		for _, result := range results {
+			if result.Error == nil {
+				output[result.Name] = result.Response
+			}
+		}
 		// Pretty print the JSON output
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(secretResp); err != nil {
+		if err := encoder.Encode(output); err != nil {
 			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
-		// Print just the secret value
-		fmt.Println(secretResp.Secret.StaticVersion.Value)
+		// Print values in the order they were requested
+		for _, result := range results {
+			if result.Error == nil {
+				fmt.Printf("%s=%s\n", result.Name, result.Value)
+			}
+		}
+	}
+
+	if hasErrors {
+		os.Exit(1)
 	}
 }
