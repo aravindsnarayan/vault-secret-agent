@@ -286,30 +286,144 @@ func (c *Client) getSecrets(ctx context.Context, secretNames []string) []SecretR
 	return results
 }
 
-func main() {
-	verbose := flag.Bool("verbose", false, "Enable verbose logging")
-	jsonOutput := flag.Bool("json", false, "Output full JSON response")
-	flag.Parse()
+// extractTemplateVars extracts variable names from template content
+func extractTemplateVars(content string) []string {
+	var vars []string
+	var unique = make(map[string]bool)
 
-	args := flag.Args()
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [--verbose] [--json] <secret-name>...\n", os.Args[0])
-		os.Exit(1)
+	// Find all occurrences of {{ VAR_NAME }}
+	parts := strings.Split(content, "{{")
+	for _, part := range parts[1:] { // Skip first part (before any {{)
+		if idx := strings.Index(part, "}}"); idx != -1 {
+			varName := strings.TrimSpace(part[:idx])
+			if !unique[varName] {
+				unique[varName] = true
+				vars = append(vars, varName)
+			}
+		}
+	}
+	return vars
+}
+
+// renderTemplate replaces variables in template with their values
+func renderTemplate(content string, secrets map[string]string) string {
+	result := content
+	for name, value := range secrets {
+		placeholder := "{{ " + name + " }}"
+		result = strings.ReplaceAll(result, placeholder, value)
+	}
+	return result
+}
+
+// processTemplate reads template file, extracts variables, fetches secrets, and writes output
+func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
+	// Read template file
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		return fmt.Errorf("failed to read template file: %w", err)
 	}
 
-	secretNames := args
+	// Extract variables from template
+	vars := extractTemplateVars(string(content))
+	if len(vars) == 0 {
+		return fmt.Errorf("no variables found in template file")
+	}
+
+	c.logf("Found %d variables in template: %v", len(vars), vars)
+
+	// Fetch all secrets
+	results := c.getSecrets(ctx, vars)
+
+	// Check for errors and build secrets map
+	secrets := make(map[string]string)
+	for _, result := range results {
+		if result.Error != nil {
+			return fmt.Errorf("failed to fetch secret %q: %w", result.Name, result.Error)
+		}
+		secrets[result.Name] = result.Value
+	}
+
+	// Render template
+	rendered := renderTemplate(string(content), secrets)
+
+	// Write output file
+	if err := os.WriteFile(outputPath, []byte(rendered), 0600); err != nil {
+		return fmt.Errorf("failed to write output file: %w", err)
+	}
+
+	c.logf("Successfully rendered template and wrote output to %s", outputPath)
+	return nil
+}
+
+func main() {
+	// Define flags
+	verbose := flag.Bool("verbose", false, "Enable verbose logging")
+	flag.BoolVar(verbose, "v", false, "")
+
+	response := flag.Bool("response", false, "Output full API response")
+	flag.BoolVar(response, "r", false, "")
+
+	templatePath := flag.String("template", "", "Path to template file")
+	flag.StringVar(templatePath, "t", "", "")
+
+	outputPath := flag.String("output", "", "Path to output file (required with template)")
+	flag.StringVar(outputPath, "o", "", "")
+
+	// Set custom usage
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <secret-name>... or\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "       %s [options] --template=<file> --output=<file>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  -v, --verbose         Enable verbose logging\n")
+		fmt.Fprintf(os.Stderr, "  -r, --response        Output full API response\n")
+		fmt.Fprintf(os.Stderr, "  -t, --template=<file> Path to template file\n")
+		fmt.Fprintf(os.Stderr, "  -o, --output=<file>   Path to output file (required with template)\n")
+	}
+
+	// Parse flags
+	flag.Parse()
+
+	// Create client with verbose flag
 	client, err := newClient(*verbose)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating client: %v\n", err)
 		os.Exit(1)
 	}
 
+	// Get access token
 	if err := client.getAccessToken(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting access token: %v\n", err)
 		os.Exit(1)
 	}
 
 	ctx := context.Background()
+
+	// Handle template mode
+	if *templatePath != "" {
+		if *outputPath == "" {
+			fmt.Fprintf(os.Stderr, "Error: -o, --output=<file> is required when using -t, --template\n")
+			os.Exit(1)
+		}
+		if *response {
+			fmt.Fprintf(os.Stderr, "Error: -r, --response cannot be used with template mode\n")
+			fmt.Fprintf(os.Stderr, "Template mode renders variables into a file, while response mode outputs detailed API responses\n")
+			os.Exit(1)
+		}
+		if err := client.processTemplate(ctx, *templatePath, *outputPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Error processing template: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Handle normal mode
+	args := flag.Args()
+	if len(args) < 1 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	secretNames := args
 	results := client.getSecrets(ctx, secretNames)
 
 	// Check if any errors occurred
@@ -321,19 +435,19 @@ func main() {
 		}
 	}
 
-	if *jsonOutput {
-		// Create a map for JSON output
+	if *response {
+		// Create a map for response output
 		output := make(map[string]interface{})
 		for _, result := range results {
 			if result.Error == nil {
 				output[result.Name] = result.Response
 			}
 		}
-		// Pretty print the JSON output
+		// Pretty print the response output
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
 		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error encoding response: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
