@@ -23,13 +23,13 @@ A command-line tool that fetches secrets from HCP Vault Secrets, similar to vaul
 ## Installation
 
 ```bash
-go install github.com/yourusername/vault-secret-agent@latest
+go install github.com/aravindsnarayan/vault-secret-agent@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/yourusername/vault-secret-agent.git
+git clone https://github.com/aravindsnarayan/vault-secret-agent.git
 cd vault-secret-agent
 go build
 ```

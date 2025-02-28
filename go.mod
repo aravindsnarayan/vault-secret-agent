@@ -1,4 +1,4 @@
-module vault-secret-agent
+module github.com/aravindsnarayan/vault-secret-agent
 
 go 1.21
 
