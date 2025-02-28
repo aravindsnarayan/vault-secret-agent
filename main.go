@@ -21,6 +21,48 @@ const (
 	authURL       = "https://auth.hashicorp.com/oauth/token"
 )
 
+// maskString masks a string by showing only the first 4 and last 4 characters
+func maskString(s string) string {
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "****" + s[len(s)-4:]
+}
+
+// maskURL replaces sensitive information in URLs with masked versions
+func maskURL(url string) string {
+	// List of parameters to mask in URLs
+	sensitiveParams := []string{
+		"client_id",
+		"client_secret",
+		"access_token",
+		"token",
+	}
+
+	maskedURL := url
+	for _, param := range sensitiveParams {
+		// Find parameter in query string
+		paramIndex := strings.Index(maskedURL, param+"=")
+		if paramIndex == -1 {
+			continue
+		}
+
+		// Find the end of the parameter value
+		valueStart := paramIndex + len(param) + 1
+		valueEnd := strings.Index(maskedURL[valueStart:], "&")
+		if valueEnd == -1 {
+			valueEnd = len(maskedURL)
+		} else {
+			valueEnd += valueStart
+		}
+
+		// Replace the value with masked version
+		maskedURL = maskedURL[:valueStart] + "****" + maskedURL[valueEnd:]
+	}
+
+	return maskedURL
+}
+
 type Client struct {
 	httpClient *retryablehttp.Client
 	baseURL    string
@@ -67,7 +109,8 @@ func newClient(verbose bool) (*Client, error) {
 	if verbose {
 		logger = log.New(os.Stderr, "vault-secret-agent: ", log.Ltime)
 	}
-	retryClient.Logger = logger
+	// Disable retryablehttp's internal logging
+	retryClient.Logger = nil
 
 	return &Client{
 		httpClient: retryClient,
@@ -118,12 +161,13 @@ func (c *Client) getAccessToken() error {
 	}
 
 	c.token = tokenResp.AccessToken
-	c.logf("Successfully obtained access token")
+	c.logf("Successfully obtained access token (masked: %s)", maskString(tokenResp.AccessToken))
 	return nil
 }
 
 func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error) {
-	c.logf("Making request to %s %s", req.Method, req.URL.String())
+	maskedURL := maskURL(req.URL.String())
+	c.logf("Making request to %s %s", req.Method, maskedURL)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -153,7 +197,9 @@ func (c *Client) getSecret(ctx context.Context, secretName string) (*SecretRespo
 		return nil, fmt.Errorf("HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set")
 	}
 
-	c.logf("Fetching secret %q from HCP Vault Secrets...", secretName)
+	c.logf("Fetching secret %q from HCP Vault Secrets (org: %s, project: %s, app: %s)...",
+		secretName, maskString(orgID), maskString(projectID), appName)
+
 	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
 		c.baseURL, orgID, projectID, appName, secretName)
 
