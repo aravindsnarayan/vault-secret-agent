@@ -60,6 +60,17 @@ func maskURL(url string) string {
 		maskedURL = maskedURL[:valueStart] + "****" + maskedURL[valueEnd:]
 	}
 
+	// Also mask organization and project IDs in path segments
+	parts := strings.Split(maskedURL, "/")
+	for i, part := range parts {
+		if i > 0 && (parts[i-1] == "organizations" || parts[i-1] == "projects") {
+			if len(part) > 8 {
+				parts[i] = maskString(part)
+			}
+		}
+	}
+	maskedURL = strings.Join(parts, "/")
+
 	return maskedURL
 }
 
