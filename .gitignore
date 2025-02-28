@@ -29,3 +29,5 @@ go.work
 Thumbs.db
 env.tmpl
 secrets.env
+optimisations.txt
+agent.hcl

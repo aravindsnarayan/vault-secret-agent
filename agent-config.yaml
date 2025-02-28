@@ -1,0 +1,32 @@
+agent:
+  # HCP Authentication
+  hcp:
+    client_id: ${HCP_CLIENT_ID}
+    client_secret: ${HCP_CLIENT_SECRET}
+    organization_id: ${HCP_ORGANIZATION_ID}
+    project_id: ${HCP_PROJECT_ID}
+    app_name: ${HCP_APP_NAME}
+
+  # Agent behavior settings
+  settings:
+    render_interval: 5s     # How often to check and render templates
+    exit_on_retry_failure: false  # Whether to exit if max retries reached
+    retry:
+      max_attempts: 3        # Maximum retry attempts
+      backoff_initial: 1s    # Initial backoff duration
+      backoff_max: 30s       # Maximum backoff duration
+      jitter: true          # Add randomness to backoff
+
+  # Logging configuration
+  logging:
+    level: info  # debug, info, warn, error
+    format: text # text or json
+    mask_secrets: true
+
+  # Templates to render
+  templates:
+    - source: "env.tmpl"
+      destination: "secrets.env"
+      error_on_missing_key: true
+      create_directories: true
+      permissions: "0600" 
