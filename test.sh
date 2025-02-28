@@ -16,14 +16,13 @@ print_result() {
 }
 
 cleanup() {
-    rm -f output.log secrets.env
+    rm -f output.log secrets.env agent.log
 }
 
 # Function to kill background processes on exit
 kill_agent() {
     if [ -n "$AGENT_PID" ]; then
         kill $AGENT_PID 2>/dev/null || true
-        rm -f agent.log
     fi
 }
 
@@ -150,7 +149,6 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     
     # Cleanup agent
     kill $AGENT_PID
-    rm -f agent.log
 else
     echo -e "\n5. Skipping API tests - environment variables not set"
 fi
