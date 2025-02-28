@@ -30,9 +30,6 @@ Thumbs.db
 env.tmpl
 secrets.env
 optimisations.txt
-agent.hcl
-test.sh
 
 # Application specific files
 agent_*.log
-*_test.sh

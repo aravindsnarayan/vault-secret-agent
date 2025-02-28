@@ -1,108 +1,171 @@
-# HCP Vault Secret Agent
+# Vault Secret Agent
 
-A command-line tool that fetches secrets from HCP Vault Secrets, similar to vault agent for self-hosted vault.
+A powerful and flexible tool for managing secrets from HashiCorp Cloud Platform (HCP) Vault. This agent helps you securely retrieve and manage secrets in your applications.
 
-## Features
+## 🌟 Features
 
-- Fetch one or more secrets from HCP Vault Secrets using the latest API (2023-11-28)
-- Concurrent fetching of multiple secrets
-- Automatic token refresh
-- Retryable HTTP client with error handling
-- Simple CLI interface
-- Verbose logging option for debugging
+- **Multiple Operating Modes**:
+  - Direct secret retrieval
+  - Template-based secret injection
+  - Background agent mode for continuous updates
 
-## Prerequisites
+- **User-Friendly Interface**:
+  - Simple command-line interface
+  - Clear error messages
+  - Detailed help documentation
 
-- Go 1.21 or later
-- HCP account with access to Vault Secrets
-- Required environment variables:
-  - `HCP_CLIENT_ID`: Your HCP service principal client ID
-  - `HCP_CLIENT_SECRET`: Your HCP service principal client secret
-  - `HCP_ORGANIZATION_ID`: Your HCP organization ID
-  - `HCP_PROJECT_ID`: Your HCP project ID
-  - `HCP_APP_NAME`: Your HCP Vault Secrets application name
+- **Secure by Design**:
+  - Automatic secret masking in logs
+  - Secure file permissions
+  - Environment variable support for credentials
 
-## Installation
+## 🚀 Quick Start
 
-```bash
-go install github.com/aravindsnarayan/vault-secret-agent@latest
-```
+### Prerequisites
 
-Or build from source:
+- HCP Vault account credentials
+- The following environment variables set:
+  ```bash
+  export HCP_CLIENT_ID="your-client-id"
+  export HCP_CLIENT_SECRET="your-client-secret"
+  export HCP_ORGANIZATION_ID="your-org-id"
+  export HCP_PROJECT_ID="your-project-id"
+  export HCP_APP_NAME="your-app-name"
+  ```
 
-```bash
-git clone https://github.com/aravindsnarayan/vault-secret-agent.git
-cd vault-secret-agent
-go build
-```
-
-## Usage
+### Installation
 
 ```bash
-# Set required environment variables
-export HCP_CLIENT_ID="your-client-id"
-export HCP_CLIENT_SECRET="your-client-secret"
-export HCP_ORGANIZATION_ID="your-org-id"
-export HCP_PROJECT_ID="your-project-id"
-export HCP_APP_NAME="your-app-name"
-
-# Fetch a single secret
-./vault-secret-agent SECRET_NAME
-
-# Fetch multiple secrets
-./vault-secret-agent SECRET1 SECRET2 SECRET3
-
-# Fetch multiple secrets with verbose logging
-./vault-secret-agent --verbose SECRET1 SECRET2 SECRET3
-
-# Fetch multiple secrets with full JSON output
-./vault-secret-agent --json SECRET1 SECRET2 SECRET3
+go build -o vault-secret-agent
 ```
 
-The tool will output the secret values to stdout in `KEY=VALUE` format, making it easy to use in scripts or other automation tools. When fetching multiple secrets, each secret is fetched concurrently for better performance.
+### Basic Usage
 
-When using the `--verbose` flag, the tool will output detailed information about:
-- Authentication process
-- API requests and responses
-- Token refresh attempts
-- Secret retrieval status
+1. **Get a Single Secret**:
+   ```bash
+   ./vault-secret-agent SECRET_NAME
+   ```
 
-When using the `--json` flag, the tool will output the full JSON response from HCP Vault Secrets, with secrets organized by name.
+2. **Get Multiple Secrets**:
+   ```bash
+   ./vault-secret-agent SECRET1 SECRET2 SECRET3
+   ```
 
-### Output Formats
+3. **Get Full Secret Response** (includes metadata):
+   ```bash
+   ./vault-secret-agent --response SECRET_NAME
+   ```
 
-Default output (KEY=VALUE):
-```bash
-SECRET1=value1
-SECRET2=value2
-SECRET3=value3
-```
+### Template Mode
 
-JSON output (with --json flag):
-```json
-{
-  "SECRET1": {
-    "secret": {
-      "name": "SECRET1",
-      "type": "kv",
-      "latest_version": 1,
-      ...
-    }
-  },
-  "SECRET2": {
-    ...
-  }
-}
-```
+Create environment files from templates:
 
-## Error Handling
+1. Create a template file (e.g., `env.tmpl`):
+   ```
+   DATABASE_URL={{ DATABASE_URL }}
+   API_KEY={{ API_KEY }}
+   ```
 
-The tool includes comprehensive error handling:
-- Environment variable validation
-- API authentication errors with automatic token refresh
-- Structured error responses from the API
-- Network retries with backoff
+2. Generate the environment file:
+   ```bash
+   ./vault-secret-agent --template=env.tmpl --output=.env
+   ```
 
-## License
+### Agent Mode
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+Run as a background service that automatically updates secrets:
+
+1. Create a configuration file (e.g., `agent-config.yaml`):
+   ```yaml
+   agent:
+     hcp:
+       client_id: ${HCP_CLIENT_ID}
+       client_secret: ${HCP_CLIENT_SECRET}
+       organization_id: ${HCP_ORGANIZATION_ID}
+       project_id: ${HCP_PROJECT_ID}
+       app_name: ${HCP_APP_NAME}
+
+     settings:
+       render_interval: 5s
+       exit_on_retry_failure: false
+       retry:
+         max_attempts: 3
+         backoff_initial: 1s
+         backoff_max: 30s
+         jitter: true
+
+     logging:
+       level: info
+       format: text
+       mask_secrets: true
+
+     templates:
+       - source: "env.tmpl"
+         destination: "secrets.env"
+         error_on_missing_key: true
+         create_directories: true
+         permissions: "0600"
+   ```
+
+2. Start the agent:
+   ```bash
+   ./vault-secret-agent --agent --config=agent-config.yaml
+   ```
+
+## 🛠️ Command-Line Options
+
+- `-a, --agent`: Run in agent mode
+- `-c, --config=<file>`: Path to agent configuration file
+- `-h, --help`: Show help message
+- `-o, --output=<file>`: Output file for template mode
+- `-r, --response`: Show full API response
+- `-t, --template=<file>`: Template file to process
+- `-v, --version`: Show version information
+- `-vvv, --verbose`: Enable verbose logging
+
+## 📝 Configuration
+
+### Agent Configuration Options
+
+- **HCP Settings**:
+  - Authentication credentials
+  - Organization and project details
+
+- **Behavior Settings**:
+  - `render_interval`: How often to check for updates
+  - `exit_on_retry_failure`: Whether to exit on repeated failures
+  - Retry settings for resilience
+
+- **Logging**:
+  - Log level (debug, info, warn, error)
+  - Format (text or JSON)
+  - Secret masking for security
+
+- **Templates**:
+  - Source and destination paths
+  - Error handling options
+  - File permissions
+
+## 🔒 Security Best Practices
+
+1. Store credentials in environment variables
+2. Use appropriate file permissions (default: 0600)
+3. Enable secret masking in logs
+4. Regularly rotate HCP credentials
+5. Use the minimum required permissions
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run the test suite: `./test.sh`
+5. Submit a pull request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## 🆘 Support
+
+For issues and feature requests, please create an issue in the repository. 

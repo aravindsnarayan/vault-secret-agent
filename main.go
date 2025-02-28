@@ -23,6 +23,7 @@ import (
 const (
 	hcpAPIBaseURL = "https://api.cloud.hashicorp.com/secrets/2023-11-28"
 	authURL       = "https://auth.hashicorp.com/oauth/token"
+	version       = "0.1.0" // Current version of the binary
 )
 
 // maskString masks a string by showing only the first 4 and last 4 characters
@@ -122,11 +123,12 @@ var (
 	output      string
 	agentMode   bool
 	agentConfig string
+	showVersion bool
 )
 
 func init() {
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
-	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
+	flag.BoolVar(&verbose, "vvv", false, "Enable verbose logging")
 	flag.BoolVar(&response, "response", false, "Output full API response")
 	flag.BoolVar(&response, "r", false, "Output full API response")
 	flag.StringVar(&template, "template", "", "Path to template file")
@@ -134,7 +136,11 @@ func init() {
 	flag.StringVar(&output, "output", "", "Path to output file")
 	flag.StringVar(&output, "o", "", "Path to output file")
 	flag.BoolVar(&agentMode, "agent", false, "Run in agent mode")
+	flag.BoolVar(&agentMode, "a", false, "Run in agent mode")
 	flag.StringVar(&agentConfig, "config", "", "Path to agent configuration file")
+	flag.StringVar(&agentConfig, "c", "", "Path to agent configuration file")
+	flag.BoolVar(&showVersion, "version", false, "Show version information")
+	flag.BoolVar(&showVersion, "v", false, "Show version information")
 }
 
 func newClient(verbose bool) (*Client, error) {
@@ -192,7 +198,7 @@ func (c *Client) getAccessToken(clientID, clientSecret string) (string, error) {
 	params.Set("audience", "https://api.hashicorp.cloud")
 
 	// Create request
-	req, err := retryablehttp.NewRequest("POST", "https://auth.hashicorp.com/oauth/token", strings.NewReader(params.Encode()))
+	req, err := retryablehttp.NewRequest("POST", authURL, strings.NewReader(params.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -254,7 +260,7 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 		name, maskString(c.orgID), maskString(c.projectID), c.appName)
 
 	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
-		c.baseURL, c.orgID, c.projectID, c.appName, name)
+		hcpAPIBaseURL, c.orgID, c.projectID, c.appName, name)
 
 	c.logf("Making request to GET %s", maskURL(url))
 
@@ -265,7 +271,11 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
 
-	resp, err := c.httpClient.Do(req)
+	// Use context
+	req.WithContext(ctx)
+
+	// Use doWithRetry instead of direct client.Do
+	resp, err := c.doWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -330,35 +340,6 @@ func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretRespon
 	return results
 }
 
-// extractTemplateVars extracts variable names from template content
-func extractTemplateVars(content string) []string {
-	var vars []string
-	var unique = make(map[string]bool)
-
-	// Find all occurrences of {{ VAR_NAME }}
-	parts := strings.Split(content, "{{")
-	for _, part := range parts[1:] { // Skip first part (before any {{)
-		if idx := strings.Index(part, "}}"); idx != -1 {
-			varName := strings.TrimSpace(part[:idx])
-			if !unique[varName] {
-				unique[varName] = true
-				vars = append(vars, varName)
-			}
-		}
-	}
-	return vars
-}
-
-// renderTemplate replaces variables in template with their values
-func renderTemplate(content string, secrets map[string]string) string {
-	result := content
-	for name, value := range secrets {
-		placeholder := "{{ " + name + " }}"
-		result = strings.ReplaceAll(result, placeholder, value)
-	}
-	return result
-}
-
 // processTemplate reads template file, extracts variables, fetches secrets, and writes output
 func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
 	// Read template file
@@ -381,42 +362,22 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 
 	c.logf("Found %d variables in template: %v", len(variables), variables)
 
-	// Get all secrets concurrently
-	var wg sync.WaitGroup
-	secretCh := make(chan *SecretResponse, len(variables))
-	errCh := make(chan error, len(variables))
-
-	for _, name := range variables {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
-			secret, err := c.getSecret(ctx, name)
-			if err != nil {
-				errCh <- fmt.Errorf("failed to get secret %q: %w", name, err)
-				return
-			}
-			secretCh <- secret
-		}(name)
-	}
-
-	// Wait for all goroutines to finish
-	wg.Wait()
-	close(secretCh)
-	close(errCh)
+	// Get all secrets concurrently using getSecrets
+	secrets := c.getSecrets(ctx, variables)
 
 	// Check for errors
-	if len(errCh) > 0 {
-		var errs []string
-		for err := range errCh {
-			errs = append(errs, err.Error())
+	var errs []string
+	values := make(map[string]string)
+	for _, secret := range secrets {
+		if secret.Error != nil {
+			errs = append(errs, fmt.Sprintf("failed to get secret %q: %v", secret.Name, secret.Error))
+			continue
 		}
-		return fmt.Errorf("failed to get secrets: %s", strings.Join(errs, "; "))
+		values[secret.Name] = secret.Value
 	}
 
-	// Create map of variables to values
-	values := make(map[string]string)
-	for secret := range secretCh {
-		values[secret.Name] = secret.Value
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to get secrets: %s", strings.Join(errs, "; "))
 	}
 
 	// Replace variables in template
@@ -442,15 +403,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "       %s [options] --template=<file> --output=<file> or\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "       %s --agent --config=<file>\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  -v, --verbose         Enable verbose logging\n")
+		fmt.Fprintf(os.Stderr, "  -a, --agent           Run in agent mode\n")
+		fmt.Fprintf(os.Stderr, "  -c, --config=<file>   Path to agent configuration file (required with agent)\n")
+		fmt.Fprintf(os.Stderr, "  -h, --help            Show this help message\n")
+		fmt.Fprintf(os.Stderr, "  -o, --output=<file>   Path to output file (required with template)\n")
 		fmt.Fprintf(os.Stderr, "  -r, --response        Output full API response\n")
 		fmt.Fprintf(os.Stderr, "  -t, --template=<file> Path to template file\n")
-		fmt.Fprintf(os.Stderr, "  -o, --output=<file>   Path to output file (required with template)\n")
-		fmt.Fprintf(os.Stderr, "  --agent               Run in agent mode\n")
-		fmt.Fprintf(os.Stderr, "  --config=<file>       Path to agent configuration file (required with agent)\n")
+		fmt.Fprintf(os.Stderr, "  -v, --version         Show version information\n")
+		fmt.Fprintf(os.Stderr, "  -vvv, --verbose       Enable verbose logging\n")
 	}
 
 	flag.Parse()
+
+	// Handle version flag
+	if showVersion {
+		fmt.Printf("vault-secret-agent version %s\n", version)
+		os.Exit(0)
+	}
 
 	// Handle agent mode
 	if agentMode {
@@ -483,6 +452,26 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Validate template mode arguments
+	if template != "" {
+		if output == "" {
+			fmt.Fprintf(os.Stderr, "Error: -o, --output=<file> is required when using -t, --template\n")
+			os.Exit(1)
+		}
+		if response {
+			fmt.Fprintf(os.Stderr, "Error: -r, --response cannot be used with template mode\n")
+			fmt.Fprintf(os.Stderr, "Template mode renders variables into a file, while response mode outputs detailed API responses\n")
+			os.Exit(1)
+		}
+	} else {
+		// Not in template mode, validate secret names
+		secretNames := flag.Args()
+		if len(secretNames) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: at least one secret name is required\n")
+			os.Exit(1)
+		}
+	}
+
 	// Create context that we can cancel in a defer
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -496,15 +485,6 @@ func main() {
 
 	// Handle template mode
 	if template != "" {
-		if output == "" {
-			fmt.Fprintf(os.Stderr, "Error: -o, --output=<file> is required when using -t, --template\n")
-			os.Exit(1)
-		}
-		if response {
-			fmt.Fprintf(os.Stderr, "Error: -r, --response cannot be used with template mode\n")
-			fmt.Fprintf(os.Stderr, "Template mode renders variables into a file, while response mode outputs detailed API responses\n")
-			os.Exit(1)
-		}
 		if err := client.processTemplate(ctx, template, output); err != nil {
 			fmt.Fprintf(os.Stderr, "Error processing template: %v\n", err)
 			os.Exit(1)
@@ -512,14 +492,8 @@ func main() {
 		return
 	}
 
-	// Get secret names from remaining args
-	secretNames := flag.Args()
-	if len(secretNames) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: at least one secret name is required\n")
-		os.Exit(1)
-	}
-
 	// Process each secret
+	secretNames := flag.Args()
 	for _, name := range secretNames {
 		secret, err := client.getSecret(ctx, name)
 		if err != nil {
