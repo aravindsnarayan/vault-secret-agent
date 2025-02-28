@@ -247,11 +247,12 @@ func (c *Client) getSecret(ctx context.Context, secretName string) (*SecretRespo
 
 func main() {
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
+	jsonOutput := flag.Bool("json", false, "Output full JSON response")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) != 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [--verbose] <secret-name>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [--verbose] [--json] <secret-name>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -274,6 +275,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Print just the secret value
-	fmt.Println(secretResp.Secret.StaticVersion.Value)
+	if *jsonOutput {
+		// Pretty print the JSON output
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(secretResp); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Print just the secret value
+		fmt.Println(secretResp.Secret.StaticVersion.Value)
+	}
 }
