@@ -50,6 +50,9 @@ export HCP_APP_NAME="your-app-name"
 
 # Fetch a secret with verbose logging
 ./vault-secret-agent --verbose SECRET_NAME
+
+# Fetch a secret with full JSON output
+./vault-secret-agent --json SECRET_NAME
 ```
 
 The tool will output the secret value to stdout, making it easy to use in scripts or other automation tools.
@@ -59,6 +62,8 @@ When using the `--verbose` flag, the tool will output detailed information about
 - API requests and responses
 - Token refresh attempts
 - Secret retrieval status
+
+When using the `--json` flag, the tool will output the full JSON response from HCP Vault Secrets instead of just the secret value.
 
 ## Error Handling
 
