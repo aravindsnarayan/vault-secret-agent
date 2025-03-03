@@ -152,6 +152,33 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     grep -q "Getting access token from HCP auth service" output.log
     print_result "Verbose logging works"
     
+    # Test enhanced masking
+    echo "Testing enhanced masking..."
+    # Test JWT token masking
+    grep -q "eyJh.*" output.log
+    print_result "JWT token masking works"
+    
+    # Test UUID masking
+    if grep -q "[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}" output.log; then
+        echo -e "${RED}✗ Found unmasked UUID in logs${NC}"
+        exit 1
+    fi
+    print_result "UUID masking works"
+    
+    # Test URL parameter masking
+    if grep -q "client_id=[^*]" output.log || grep -q "client_secret=[^*]" output.log; then
+        echo -e "${RED}✗ Found unmasked credentials in URL${NC}"
+        exit 1
+    fi
+    print_result "URL parameter masking works"
+    
+    # Test organization/project ID masking
+    if grep -q "organizations/[^*]" output.log || grep -q "projects/[^*]" output.log; then
+        echo -e "${RED}✗ Found unmasked organization or project ID${NC}"
+        exit 1
+    fi
+    print_result "Organization/Project ID masking works"
+    
     # Test response flag
     echo "Testing response flag..."
     ./vault-secret-agent -r FG_RELEASE_VERSION | jq . >/dev/null 2>&1

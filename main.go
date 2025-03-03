@@ -35,6 +35,70 @@ func maskString(s string) string {
 	return s[:4] + "****" + s[len(s)-4:]
 }
 
+// maskSensitiveData masks sensitive data in a string based on common patterns
+func maskSensitiveData(s string) string {
+	// Common sensitive data patterns
+	patterns := []struct {
+		regex       *regexp.Regexp
+		maskFunc    func(string) string
+		description string
+	}{
+		{
+			// JWT tokens (base64 encoded strings with dots)
+			regexp.MustCompile(`eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+`),
+			maskString,
+			"JWT token",
+		},
+		{
+			// UUIDs
+			regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`),
+			maskString,
+			"UUID",
+		},
+		{
+			// API keys (common formats)
+			regexp.MustCompile(`(?i)(key|token|secret)[-_]?[0-9a-f]{8,}`),
+			maskString,
+			"API key",
+		},
+		{
+			// Base64 encoded strings (at least 20 chars)
+			regexp.MustCompile(`[A-Za-z0-9+/]{20,}={0,2}`),
+			maskString,
+			"Base64 data",
+		},
+		{
+			// IP addresses
+			regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`),
+			func(s string) string { return "***.***.***.**" },
+			"IP address",
+		},
+		{
+			// Email addresses
+			regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b`),
+			func(s string) string {
+				parts := strings.Split(s, "@")
+				if len(parts) != 2 {
+					return "****@****.***"
+				}
+				maskedLocal := maskString(parts[0])
+				return maskedLocal + "@" + parts[1]
+			},
+			"email address",
+		},
+	}
+
+	result := s
+	for _, p := range patterns {
+		result = p.regex.ReplaceAllStringFunc(result, func(match string) string {
+			masked := p.maskFunc(match)
+			return masked
+		})
+	}
+
+	return result
+}
+
 // maskURL replaces sensitive information in URLs with masked versions
 func maskURL(url string) string {
 	// List of parameters to mask in URLs
@@ -43,6 +107,11 @@ func maskURL(url string) string {
 		"client_secret",
 		"access_token",
 		"token",
+		"key",
+		"password",
+		"secret",
+		"auth",
+		"credential",
 	}
 
 	maskedURL := url
@@ -77,7 +146,8 @@ func maskURL(url string) string {
 	}
 	maskedURL = strings.Join(parts, "/")
 
-	return maskedURL
+	// Apply general sensitive data masking
+	return maskSensitiveData(maskedURL)
 }
 
 type Client struct {
@@ -200,7 +270,16 @@ func newClient(verbose bool) (*Client, error) {
 
 func (c *Client) logf(format string, v ...interface{}) {
 	if c.verbose {
-		c.logger.Printf(format, v...)
+		// Apply masking to all string arguments
+		maskedArgs := make([]interface{}, len(v))
+		for i, arg := range v {
+			if str, ok := arg.(string); ok {
+				maskedArgs[i] = maskSensitiveData(str)
+			} else {
+				maskedArgs[i] = arg
+			}
+		}
+		c.logger.Printf(format, maskedArgs...)
 	}
 }
 
