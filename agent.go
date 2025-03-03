@@ -221,6 +221,9 @@ func (a *Agent) processTemplate(tmpl TemplateConfig) {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
+			// Log template processing start
+			fmt.Printf("Processing template %s -> %s\n", tmpl.Source, tmpl.Destination)
+
 			if err := a.renderTemplate(tmpl); err != nil {
 				if a.config.Agent.Settings.ExitOnRetryFailure {
 					fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
@@ -228,6 +231,8 @@ func (a *Agent) processTemplate(tmpl TemplateConfig) {
 					return
 				}
 				fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
+			} else {
+				fmt.Printf("Successfully rendered template %s\n", tmpl.Source)
 			}
 		}
 	}
@@ -235,5 +240,7 @@ func (a *Agent) processTemplate(tmpl TemplateConfig) {
 
 // renderTemplate renders a single template
 func (a *Agent) renderTemplate(tmpl TemplateConfig) error {
+	// Log start of template rendering
+	fmt.Printf("Starting template rendering process for %s\n", tmpl.Source)
 	return a.client.processTemplate(a.ctx, tmpl.Source, tmpl.Destination)
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -155,20 +156,26 @@ func newClient(verbose bool) (*Client, error) {
 		return nil, fmt.Errorf("HCP_CLIENT_ID, HCP_CLIENT_SECRET, HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set")
 	}
 
-	// Create transport with connection pooling
+	// Create transport with optimized connection pooling
 	transport := &http.Transport{
-		MaxIdleConns:        100,              // Maximum number of idle connections
-		MaxIdleConnsPerHost: 10,               // Maximum number of idle connections per host
-		IdleConnTimeout:     90 * time.Second, // How long to keep idle connections alive
-		DisableCompression:  false,            // Enable compression for better performance
-		ForceAttemptHTTP2:   true,             // Prefer HTTP/2 when available
+		MaxIdleConns:          100,              // Maximum number of idle connections
+		MaxIdleConnsPerHost:   20,               // Increased from 10 to 20 for better connection reuse
+		MaxConnsPerHost:       50,               // Limit total connections per host
+		IdleConnTimeout:       90 * time.Second, // How long to keep idle connections alive
+		TLSHandshakeTimeout:   10 * time.Second, // Timeout for TLS handshake
+		ExpectContinueTimeout: 1 * time.Second,  // Timeout for Expect: 100-continue
+		DisableCompression:    false,            // Enable compression for better performance
+		ForceAttemptHTTP2:     true,             // Prefer HTTP/2 when available
 	}
 
-	// Create retryable HTTP client with pooled transport
+	// Create retryable HTTP client with optimized settings
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = 3
+	retryClient.RetryWaitMin = 1 * time.Second
+	retryClient.RetryWaitMax = 30 * time.Second
 	retryClient.Logger = nil // Disable internal logging
 	retryClient.HTTPClient.Transport = transport
+	retryClient.HTTPClient.Timeout = 30 * time.Second // Set overall request timeout
 
 	// Create client
 	client := &Client{
@@ -240,14 +247,23 @@ func (c *Client) getAccessToken(clientID, clientSecret string) (string, error) {
 }
 
 func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error) {
+	// Add request ID for better tracing
+	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+	req.Header.Set("X-Request-ID", reqID)
+
+	// Log request attempt
+	c.logf("[%s] Making request to %s", reqID, maskURL(req.URL.String()))
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.logf("[%s] Request failed: %v", reqID, err)
 		return nil, err
 	}
 
-	// Handle unauthorized response by refreshing token and retrying
-	if resp.StatusCode == http.StatusUnauthorized {
-		c.logf("Received unauthorized response, refreshing token...")
+	// Handle various status codes that warrant retries
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		c.logf("[%s] Received unauthorized response, refreshing token...", reqID)
 		resp.Body.Close()
 
 		// Get new token
@@ -259,6 +275,28 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 
 		// Retry request with new token
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+		c.logf("[%s] Retrying request with new token", reqID)
+		return c.httpClient.Do(req)
+
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		// Get retry delay from response header or use default
+		retryAfter := resp.Header.Get("Retry-After")
+		var delay time.Duration
+		if retryAfter != "" {
+			if seconds, err := strconv.Atoi(retryAfter); err == nil {
+				delay = time.Duration(seconds) * time.Second
+			}
+		}
+		if delay == 0 {
+			delay = 5 * time.Second
+		}
+
+		c.logf("[%s] Rate limited, waiting %v before retry", reqID, delay)
+		resp.Body.Close()
+		time.Sleep(delay)
+
+		// Retry the request
+		c.logf("[%s] Retrying rate-limited request", reqID)
 		return c.httpClient.Do(req)
 	}
 

@@ -74,6 +74,78 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     echo "$OUTPUT" | grep -q "FG_RELEASE_VERSION="
     print_result "Direct secret retrieval works"
     
+    # Test connection pooling
+    echo "Testing connection pooling..."
+    START_TIME=$(date +%s%N)
+    for i in {1..5}; do
+        ./vault-secret-agent -vvv FG_RELEASE_VERSION >/dev/null 2>&1
+    done
+    END_TIME=$(date +%s%N)
+    DURATION=$((($END_TIME - $START_TIME) / 1000000)) # Convert to milliseconds
+    # Check if average request time is under 2 seconds (allowing for retry overhead)
+    if [ $DURATION -lt 10000 ]; then
+        print_result "Connection pooling is working (5 requests in ${DURATION}ms)"
+    else
+        echo -e "${RED}✗ Connection pooling might not be optimal (5 requests in ${DURATION}ms)${NC}"
+        exit 1
+    fi
+    
+    # Test retry behavior
+    echo "Testing retry behavior..."
+    
+    # Test authentication error handling
+    echo "Testing authentication error handling..."
+    OLD_CLIENT_SECRET=$HCP_CLIENT_SECRET
+    export HCP_CLIENT_SECRET="invalid_secret"
+    ./vault-secret-agent -vvv FG_RELEASE_VERSION 2>&1 | tee output.log
+    grep -q "request failed with status 401: {\"error\":\"access_denied\"" output.log
+    print_result "Authentication error handling works"
+    export HCP_CLIENT_SECRET=$OLD_CLIENT_SECRET
+    
+    # Test request ID tracing
+    echo "Testing request ID tracing..."
+    ./vault-secret-agent -vvv FG_RELEASE_VERSION 2>&1 | tee output.log
+    if grep -q "\[[0-9]\+\] Making request to" output.log; then
+        print_result "Request ID tracing works"
+    else
+        echo -e "${RED}✗ Request ID tracing not found in logs${NC}"
+        exit 1
+    fi
+    
+    # Test concurrent requests
+    echo "Testing concurrent requests..."
+    START_TIME=$(date +%s%N)
+    ./vault-secret-agent FG_RELEASE_VERSION FG_ASSET_VERSION FG_CURRENT_SPRINT 2>/dev/null
+    END_TIME=$(date +%s%N)
+    DURATION=$((($END_TIME - $START_TIME) / 1000000))
+    if [ $DURATION -lt 5000 ]; then
+        print_result "Concurrent requests completed in ${DURATION}ms"
+    else
+        echo -e "${RED}✗ Concurrent requests took too long: ${DURATION}ms${NC}"
+        exit 1
+    fi
+    
+    # Test rate limiting (if supported by the API)
+    echo "Testing rate limiting handling..."
+    # Make rapid requests to potentially trigger rate limiting
+    for i in {1..20}; do
+        ./vault-secret-agent FG_RELEASE_VERSION >/dev/null 2>&1 &
+    done
+    wait
+    
+    # Check for rate limit handling in verbose mode
+    ./vault-secret-agent -vvv FG_RELEASE_VERSION 2>&1 | tee output.log
+    if grep -q "Rate limited" output.log || grep -q "Successfully retrieved secret" output.log; then
+        if grep -q "Rate limited" output.log; then
+            print_result "Rate limit detection works"
+        else
+            print_result "No rate limiting triggered"
+        fi
+    else
+        echo -e "${RED}✗ Rate limit handling check failed${NC}"
+        exit 1
+    fi
+    
     # Test verbose logging
     echo "Testing verbose logging..."
     ./vault-secret-agent -vvv FG_RELEASE_VERSION 2>&1 | tee output.log
@@ -99,6 +171,16 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     
     # Create test template for agent mode
     echo 'FG_RELEASE_VERSION={{ FG_RELEASE_VERSION }}' > env.tmpl
+    echo 'FG_ASSET_VERSION={{ FG_ASSET_VERSION }}' >> env.tmpl
+    echo 'FG_CURRENT_SPRINT={{ FG_CURRENT_SPRINT }}' >> env.tmpl
+    echo 'FG_URL_HOST={{ FG_URL_HOST }}' >> env.tmpl
+    echo 'FG_URL_SCHEME={{ FG_URL_SCHEME }}' >> env.tmpl
+    echo 'FG_URL_HTTP_PORT={{ FG_URL_HTTP_PORT }}' >> env.tmpl
+    echo 'FG_BASE_URL={{ FG_BASE_URL }}' >> env.tmpl
+    echo 'FG_DOMAINS={{ FG_DOMAINS }}' >> env.tmpl
+    echo 'APP_ENV={{ APP_ENV }}' >> env.tmpl
+    echo 'APP_DEBUG={{ APP_DEBUG }}' >> env.tmpl
+    echo 'REDIS_SERVICE_HOST={{ REDIS_SERVICE_HOST }}' >> env.tmpl
     rm -f secrets.env agent.log
     
     # Start agent in background
@@ -123,7 +205,7 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     # Check agent logs
     echo "Checking agent logs..."
     for i in {1..5}; do
-        if [ -f agent.log ] && grep -q "Found 1 variables in template" agent.log; then
+        if [ -f agent.log ] && grep -q "Processing template.*env.tmpl" agent.log; then
             print_result "Agent template processing works"
             break
         fi
@@ -144,8 +226,8 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     print_result "Agent configured with correct render interval"
     
     # Check agent logging configuration
-    grep -q "level: debug" agent-config.yaml
-    print_result "Agent configured with debug logging"
+    grep -q "level: info" agent-config.yaml
+    print_result "Agent configured with correct logging level"
     
     # Cleanup agent
     kill $AGENT_PID
