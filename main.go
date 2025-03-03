@@ -12,12 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"compress/gzip"
@@ -28,7 +26,8 @@ import (
 const (
 	hcpAPIBaseURL = "https://api.cloud.hashicorp.com/secrets/2023-11-28"
 	authURL       = "https://auth.hashicorp.com/oauth/token"
-	version       = "0.1.0" // Current version of the binary
+	version       = "0.1.0"         // Current version of the binary
+	defaultTTL    = 5 * time.Minute // Default TTL for cached secrets
 )
 
 // maskString masks a string by showing only the first 4 and last 4 characters
@@ -154,6 +153,107 @@ func maskURL(url string) string {
 	return maskSensitiveData(maskedURL)
 }
 
+// CachedSecret represents a secret stored in the cache
+type CachedSecret struct {
+	Secret    *SecretResponse
+	ExpiresAt time.Time
+}
+
+// Cache represents a cache of secrets with TTL
+type Cache struct {
+	mu      sync.RWMutex
+	secrets map[string]CachedSecret
+	ttl     time.Duration
+	enabled bool
+}
+
+// NewCache creates a new cache with the specified TTL
+func NewCache(ttl time.Duration, enabled bool) *Cache {
+	if ttl <= 0 {
+		ttl = defaultTTL
+	}
+	return &Cache{
+		secrets: make(map[string]CachedSecret),
+		ttl:     ttl,
+		enabled: enabled,
+	}
+}
+
+// Get retrieves a secret from the cache if it exists and is not expired
+func (c *Cache) Get(name string) (*SecretResponse, bool) {
+	if !c.enabled {
+		return nil, false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cached, ok := c.secrets[name]
+	if !ok {
+		return nil, false
+	}
+
+	// Check if the secret has expired
+	if time.Now().After(cached.ExpiresAt) {
+		return nil, false
+	}
+
+	return cached.Secret, true
+}
+
+// Set adds a secret to the cache with the configured TTL
+func (c *Cache) Set(name string, secret *SecretResponse) {
+	if !c.enabled {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.secrets[name] = CachedSecret{
+		Secret:    secret,
+		ExpiresAt: time.Now().Add(c.ttl),
+	}
+}
+
+// Clear removes all secrets from the cache
+func (c *Cache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.secrets = make(map[string]CachedSecret)
+}
+
+// ClearExpired removes all expired secrets from the cache
+func (c *Cache) ClearExpired() int {
+	if !c.enabled {
+		return 0
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	count := 0
+
+	for name, cached := range c.secrets {
+		if now.After(cached.ExpiresAt) {
+			delete(c.secrets, name)
+			count++
+		}
+	}
+
+	return count
+}
+
+// Size returns the number of secrets in the cache
+func (c *Cache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return len(c.secrets)
+}
+
 type Client struct {
 	baseURL     string
 	httpClient  *retryablehttp.Client
@@ -163,6 +263,7 @@ type Client struct {
 	orgID       string
 	projectID   string
 	appName     string
+	cache       *Cache
 }
 
 type AccessTokenResponse struct {
@@ -214,6 +315,12 @@ type BatchSecretResponse struct {
 			} `json:"static_version"`
 		} `json:"secret"`
 	} `json:"secrets"`
+}
+
+// CacheConfig contains cache settings
+type CacheConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	TTL     time.Duration `yaml:"ttl"`
 }
 
 var (
@@ -276,7 +383,7 @@ func newClient(verbose bool) (*Client, error) {
 	retryClient.HTTPClient.Transport = transport
 	retryClient.HTTPClient.Timeout = 30 * time.Second // Set overall request timeout
 
-	// Create client
+	// Create client with default cache settings
 	client := &Client{
 		baseURL:    hcpAPIBaseURL,
 		httpClient: retryClient,
@@ -285,6 +392,7 @@ func newClient(verbose bool) (*Client, error) {
 		orgID:      orgID,
 		projectID:  projectID,
 		appName:    appName,
+		cache:      NewCache(defaultTTL, true), // Enable caching by default with default TTL
 	}
 
 	// Get access token
@@ -438,7 +546,13 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 }
 
 func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, error) {
-	c.logf("Fetching secret %q from HCP Vault Secrets (org: %s, project: %s, app: %s)...",
+	// Check cache first if enabled
+	if cached, found := c.cache.Get(name); found {
+		c.logf("Cache hit for secret %q", name)
+		return cached, nil
+	}
+
+	c.logf("Cache miss for secret %q, fetching from HCP Vault Secrets (org: %s, project: %s, app: %s)...",
 		name, maskString(c.orgID), maskString(c.projectID), c.appName)
 
 	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
@@ -491,11 +605,17 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 
 	c.logf("Successfully retrieved secret %q (version %d)", name, apiResp.Secret.StaticVersion.Version)
 
-	return &SecretResponse{
+	secret := &SecretResponse{
 		Name:     name,
 		Value:    apiResp.Secret.StaticVersion.Value,
 		Response: apiResp,
-	}, nil
+	}
+
+	// Add to cache
+	c.cache.Set(name, secret)
+	c.logf("Added secret %q to cache", name)
+
+	return secret, nil
 }
 
 // getSecretsInBatch fetches multiple secrets in a single API call
@@ -504,14 +624,33 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 		return nil, nil
 	}
 
-	c.logf("Fetching %d secrets in batch mode", len(names))
+	// Check which secrets are in the cache and which need to be fetched
+	var cachedSecrets []*SecretResponse
+	var missingNames []string
+
+	for _, name := range names {
+		if cached, found := c.cache.Get(name); found {
+			cachedSecrets = append(cachedSecrets, cached)
+			c.logf("Cache hit for secret %q", name)
+		} else {
+			missingNames = append(missingNames, name)
+		}
+	}
+
+	// If all secrets were in the cache, return them
+	if len(missingNames) == 0 {
+		c.logf("All %d secrets found in cache", len(names))
+		return cachedSecrets, nil
+	}
+
+	c.logf("Fetching %d/%d secrets in batch mode (cache miss)", len(missingNames), len(names))
 
 	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets:batchOpen",
 		hcpAPIBaseURL, c.orgID, c.projectID, c.appName)
 
 	// Create batch request
 	batchReq := BatchSecretRequest{
-		Names: names,
+		Names: missingNames,
 	}
 
 	reqBody, err := json.Marshal(batchReq)
@@ -546,25 +685,47 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 		return nil, fmt.Errorf("failed to decode batch response: %w", err)
 	}
 
-	// Convert batch response to SecretResponse array
-	results := make([]*SecretResponse, len(names))
-	for i, name := range names {
+	// Convert batch response to SecretResponse array and add to cache
+	var fetchedSecrets []*SecretResponse
+	for _, name := range missingNames {
 		if secretData, ok := batchResp.Secrets[name]; ok {
-			results[i] = &SecretResponse{
+			secret := &SecretResponse{
 				Name:     name,
 				Value:    secretData.Secret.StaticVersion.Value,
 				Response: secretData,
 			}
+			fetchedSecrets = append(fetchedSecrets, secret)
+
+			// Add to cache
+			c.cache.Set(name, secret)
+			c.logf("Added secret %q to cache", name)
 		} else {
-			results[i] = &SecretResponse{
+			secret := &SecretResponse{
 				Name:  name,
 				Error: fmt.Errorf("secret not found in batch response"),
 			}
+			fetchedSecrets = append(fetchedSecrets, secret)
 		}
 	}
 
-	c.logf("Successfully retrieved %d secrets in batch", len(names))
-	return results, nil
+	// Combine cached and fetched secrets
+	results := append(cachedSecrets, fetchedSecrets...)
+
+	// Sort results to match the original order of names
+	sortedResults := make([]*SecretResponse, len(names))
+	nameToSecret := make(map[string]*SecretResponse)
+
+	for _, secret := range results {
+		nameToSecret[secret.Name] = secret
+	}
+
+	for i, name := range names {
+		sortedResults[i] = nameToSecret[name]
+	}
+
+	c.logf("Successfully retrieved %d secrets (%d from cache, %d from API)",
+		len(sortedResults), len(cachedSecrets), len(fetchedSecrets))
+	return sortedResults, nil
 }
 
 func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretResponse {
@@ -682,6 +843,34 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 	return nil
 }
 
+// SetCacheConfig configures the client's cache
+func (c *Client) SetCacheConfig(config CacheConfig) {
+	c.cache = NewCache(config.TTL, config.Enabled)
+	c.logf("Cache configuration updated: enabled=%v, ttl=%v", config.Enabled, config.TTL)
+}
+
+// Periodically clean up expired cache entries
+func (c *Client) startCacheCleanup(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count := c.cache.ClearExpired()
+			if count > 0 {
+				c.logf("Cleaned up %d expired cache entries", count)
+			}
+		}
+	}
+}
+
 func main() {
 	// Set custom usage
 	flag.Usage = func() {
@@ -719,27 +908,22 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Create and start agent
+		// Create agent
 		agent, err := NewAgent(agentConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating agent: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Setup signal handling for graceful shutdown
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		// Create context for the agent
+		ctx := context.Background()
 
-		// Start agent
-		if err := agent.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error starting agent: %v\n", err)
+		// Run the agent
+		if err := agent.Run(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error running agent: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Wait for shutdown signal
-		sig := <-sigCh
-		fmt.Printf("Received signal %v, shutting down...\n", sig)
-		agent.Stop()
 		os.Exit(0)
 	}
 

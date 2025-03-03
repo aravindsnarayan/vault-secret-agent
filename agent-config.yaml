@@ -1,32 +1,30 @@
+hcp_auth:
+  client_id: ${HCP_CLIENT_ID}
+  client_secret: ${HCP_CLIENT_SECRET}
+  organization_id: ${HCP_ORGANIZATION_ID}
+  project_id: ${HCP_PROJECT_ID}
+  app_name: ${HCP_APP_NAME}
+
 agent:
-  # HCP Authentication
-  hcp:
-    client_id: ${HCP_CLIENT_ID}
-    client_secret: ${HCP_CLIENT_SECRET}
-    organization_id: ${HCP_ORGANIZATION_ID}
-    project_id: ${HCP_PROJECT_ID}
-    app_name: ${HCP_APP_NAME}
+  render_interval: 5s
+  no_exit_on_retry: false
+  retry:
+    max_attempts: 3
+    initial_backoff: 1s
+    max_backoff: 30s
+    use_jitter: true
+  cache:
+    enabled: true
+    ttl: 5m
 
-  # Agent behavior settings
-  settings:
-    render_interval: 5s     # How often to check and render templates
-    exit_on_retry_failure: false  # Whether to exit if max retries reached
-    retry:
-      max_attempts: 3        # Maximum retry attempts
-      backoff_initial: 1s    # Initial backoff duration
-      backoff_max: 30s       # Maximum backoff duration
-      jitter: true          # Add randomness to backoff
+logging:
+  level: info
+  format: text
+  mask_secrets: true
 
-  # Logging configuration
-  logging:
-    level: info  # debug, info, warn, error
-    format: text # text or json
-    mask_secrets: true
-
-  # Templates to render
-  templates:
-    - source: "env.tmpl"
-      destination: "secrets.env"
-      error_on_missing_key: true
-      create_directories: true
-      permissions: "0600" 
+templates:
+  - source: "env.tmpl"
+    destination: "secrets.env"
+    error_on_missing_keys: true
+    create_dir: true
+    file_perms: 0600 

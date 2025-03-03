@@ -26,6 +26,8 @@ cleanup() {
         kill $AGENT_PID 2>/dev/null || true
         print_success "Agent process terminated"
     fi
+    # Remove cache test files
+    rm -f cache-test.tmpl cache-test.env cache-config.yaml cache-test.log
     print_success "Test artifacts removed"
 }
 
@@ -121,6 +123,166 @@ EOF
     cat secrets.env
     print_success "Template rendered successfully"
 
+    # Test caching with TTL
+    print_header "Testing caching with TTL"
+    # Create test template for caching test
+    cat > cache-test.tmpl << 'EOF'
+FG_RELEASE_VERSION='{{ FG_RELEASE_VERSION }}'
+FG_ASSET_VERSION='{{ FG_ASSET_VERSION }}'
+FG_CURRENT_SPRINT='{{ FG_CURRENT_SPRINT }}'
+EOF
+    print_success "Cache test template created"
+    
+    # Create config with short TTL for testing
+    cat > cache-config.yaml << 'EOF'
+hcp_auth:
+  client_id: ${HCP_CLIENT_ID}
+  client_secret: ${HCP_CLIENT_SECRET}
+  organization_id: ${HCP_ORGANIZATION_ID}
+  project_id: ${HCP_PROJECT_ID}
+  app_name: ${HCP_APP_NAME}
+
+agent:
+  render_interval: 3s
+  no_exit_on_retry: true
+  retry:
+    max_attempts: 3
+    initial_backoff: 1s
+    max_backoff: 30s
+    use_jitter: true
+  cache:
+    enabled: true
+    ttl: 5s
+
+logging:
+  level: debug
+  format: text
+  mask_secrets: true
+
+templates:
+  - source: "cache-test.tmpl"
+    destination: "cache-test.env"
+    error_on_missing_keys: false
+    create_dir: true
+    file_perms: 0600
+EOF
+    print_success "Cache test config created with TTL of 5 seconds"
+    
+    # Start agent in background with debug logging
+    print_header "Starting agent with caching enabled"
+    ./vault-secret-agent -a -c cache-config.yaml > cache-test.log 2>&1 &
+    AGENT_PID=$!
+    print_success "Agent started with PID $AGENT_PID"
+    
+    # Wait for template to be rendered
+    print_header "Waiting for initial template rendering"
+    MAX_WAIT=30
+    WAIT_COUNT=0
+    while [ ! -f cache-test.env ] && [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+        echo -n "."
+        sleep 1
+        WAIT_COUNT=$((WAIT_COUNT + 1))
+    done
+    echo ""
+    
+    if [ -f cache-test.env ]; then
+        print_success "Initial template rendered successfully after $WAIT_COUNT seconds"
+        cat cache-test.env
+        
+        # Check for cache misses in the first run
+        CACHE_MISSES=$(grep -c "Cache miss for secret" cache-test.log)
+        if [ $CACHE_MISSES -gt 0 ]; then
+            print_success "Initial cache misses detected: $CACHE_MISSES (expected on first run)"
+            grep "Cache miss for secret" cache-test.log | head -n 3
+        fi
+        
+        # Check for secrets added to cache
+        CACHE_ADDS=$(grep -c "Added secret .* to cache" cache-test.log)
+        if [ $CACHE_ADDS -gt 0 ]; then
+            print_success "Secrets added to cache: $CACHE_ADDS"
+            grep "Added secret .* to cache" cache-test.log | head -n 3
+        fi
+        
+        print_header "Waiting for second template rendering (should use cache)"
+        echo "Waiting for next render cycle (3 seconds)..."
+        sleep 4
+        
+        # Check for cache hits in the second run
+        CACHE_HITS=$(grep -c "Cache hit for secret" cache-test.log)
+        if [ $CACHE_HITS -gt 0 ]; then
+            print_success "Cache hits detected: $CACHE_HITS (expected on second run)"
+            grep "Cache hit for secret" cache-test.log | head -n 3
+        else
+            echo "No cache hits detected. Waiting longer..."
+            sleep 4
+            CACHE_HITS=$(grep -c "Cache hit for secret" cache-test.log)
+            if [ $CACHE_HITS -gt 0 ]; then
+                print_success "Cache hits detected after waiting: $CACHE_HITS"
+                grep "Cache hit for secret" cache-test.log | head -n 3
+            else
+                echo "Still no cache hits detected. This is unexpected."
+                echo "Checking log for errors:"
+                grep -i "error" cache-test.log || echo "No errors found in log"
+            fi
+        fi
+        
+        print_header "Waiting for cache TTL to expire"
+        echo "Waiting 6 seconds for the 5-second TTL to expire..."
+        sleep 6
+        
+        print_header "Checking for cache expiry"
+        echo "Waiting for next render cycle after TTL expiry..."
+        sleep 4
+        
+        # Check for cache misses after TTL expiry
+        NEW_CACHE_MISSES=$(grep -c "Cache miss for secret" cache-test.log)
+        if [ $NEW_CACHE_MISSES -gt $CACHE_MISSES ]; then
+            print_success "Cache misses after TTL expiry: $(($NEW_CACHE_MISSES - $CACHE_MISSES))"
+            grep "Cache miss for secret" cache-test.log | tail -n 3
+        else
+            echo "No new cache misses detected after TTL expiry. Waiting longer..."
+            sleep 4
+            NEW_CACHE_MISSES=$(grep -c "Cache miss for secret" cache-test.log)
+            if [ $NEW_CACHE_MISSES -gt $CACHE_MISSES ]; then
+                print_success "Cache misses after waiting: $(($NEW_CACHE_MISSES - $CACHE_MISSES))"
+                grep "Cache miss for secret" cache-test.log | tail -n 3
+            else
+                echo "Still no new cache misses detected. This is unexpected."
+            fi
+        fi
+        
+        # Check for cache cleanup
+        CACHE_CLEANUP=$(grep -c "Cleaned up .* expired cache entries" cache-test.log)
+        if [ $CACHE_CLEANUP -gt 0 ]; then
+            print_success "Cache cleanup detected"
+            grep "Cleaned up .* expired cache entries" cache-test.log
+        else
+            echo "No cache cleanup detected. This might be expected if cleanup hasn't run yet."
+            echo "Waiting longer for cleanup..."
+            sleep 10
+            CACHE_CLEANUP=$(grep -c "Cleaned up .* expired cache entries" cache-test.log)
+            if [ $CACHE_CLEANUP -gt 0 ]; then
+                print_success "Cache cleanup detected after waiting"
+                grep "Cleaned up .* expired cache entries" cache-test.log
+            else
+                echo "Still no cache cleanup detected."
+            fi
+        fi
+        
+        print_header "Cache Test Summary"
+        echo "Cache misses: $(grep -c "Cache miss for secret" cache-test.log)"
+        echo "Cache hits: $(grep -c "Cache hit for secret" cache-test.log)"
+        echo "Cache additions: $(grep -c "Added secret .* to cache" cache-test.log)"
+        echo "Cache cleanups: $(grep -c "Cleaned up .* expired cache entries" cache-test.log)"
+    else
+        echo "Error: Template was not rendered after $MAX_WAIT seconds. Check the logs for errors."
+        cat cache-test.log
+    fi
+    
+    # Kill the agent
+    kill $AGENT_PID
+    print_success "Cache test completed"
+
     # Test agent mode
     print_header "Testing agent mode"
     # Create test template for agent mode
@@ -152,7 +314,7 @@ EOF
     
     # Show agent configuration
     print_header "Agent configuration"
-    grep "render_interval\|level:" agent-config.yaml
+    grep "render_interval\|level:\|cache:" agent-config.yaml
     print_success "Agent configured correctly"
     
     # Cleanup agent

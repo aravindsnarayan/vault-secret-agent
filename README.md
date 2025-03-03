@@ -24,6 +24,7 @@ A powerful and flexible tool for managing secrets from HashiCorp Cloud Platform 
   - Batch request mode for multiple secrets
   - Connection pooling for efficient API usage
   - Controlled concurrency for large secret sets
+  - Caching with TTL for improved response times
 
 ## 🚀 Quick Start
 
@@ -83,34 +84,36 @@ Run as a background service that automatically updates secrets:
 
 1. Create a configuration file (e.g., `agent-config.yaml`):
    ```yaml
+   hcp_auth:
+     client_id: ${HCP_CLIENT_ID}
+     client_secret: ${HCP_CLIENT_SECRET}
+     organization_id: ${HCP_ORGANIZATION_ID}
+     project_id: ${HCP_PROJECT_ID}
+     app_name: ${HCP_APP_NAME}
+
    agent:
-     hcp:
-       client_id: ${HCP_CLIENT_ID}
-       client_secret: ${HCP_CLIENT_SECRET}
-       organization_id: ${HCP_ORGANIZATION_ID}
-       project_id: ${HCP_PROJECT_ID}
-       app_name: ${HCP_APP_NAME}
+     render_interval: 5s
+     no_exit_on_retry: false
+     retry:
+       max_attempts: 3
+       initial_backoff: 1s
+       max_backoff: 30s
+       use_jitter: true
+     cache:
+       enabled: true
+       ttl: 5m
 
-     settings:
-       render_interval: 5s
-       exit_on_retry_failure: false
-       retry:
-         max_attempts: 3
-         backoff_initial: 1s
-         backoff_max: 30s
-         jitter: true
+   logging:
+     level: info
+     format: text
+     mask_secrets: true
 
-     logging:
-       level: info
-       format: text
-       mask_secrets: true
-
-     templates:
-       - source: "env.tmpl"
-         destination: "secrets.env"
-         error_on_missing_key: true
-         create_directories: true
-         permissions: "0600"
+   templates:
+     - source: "env.tmpl"
+       destination: "secrets.env"
+       error_on_missing_keys: true
+       create_dir: true
+       file_perms: 0600
    ```
 
 2. Start the agent:
@@ -133,24 +136,27 @@ Run as a background service that automatically updates secrets:
 
 ### Agent Configuration Options
 
-- **HCP Settings**:
-  - Authentication credentials
-  - Organization and project details
+- **HCP Authentication**:
+  - `client_id`, `client_secret`: Authentication credentials
+  - `organization_id`, `project_id`, `app_name`: Organization and project details
 
-- **Behavior Settings**:
+- **Agent Behavior Settings**:
   - `render_interval`: How often to check for updates
-  - `exit_on_retry_failure`: Whether to exit on repeated failures
-  - Retry settings for resilience
+  - `no_exit_on_retry`: Whether to continue running after retry failures
+  - Retry settings: `max_attempts`, `initial_backoff`, `max_backoff`, `use_jitter`
+  - Cache settings: `enabled`, `ttl` (time-to-live)
 
 - **Logging**:
-  - Log level (debug, info, warn, error)
-  - Format (text or JSON)
-  - Secret masking for security
+  - `level`: Log level (debug, info, warn, error)
+  - `format`: Output format (text or JSON)
+  - `mask_secrets`: Enable secret masking for security
 
 - **Templates**:
-  - Source and destination paths
-  - Error handling options
-  - File permissions
+  - `source`: Template file path
+  - `destination`: Output file path
+  - `error_on_missing_keys`: Whether to error on missing template variables
+  - `create_dir`: Create destination directory if it doesn't exist
+  - `file_perms`: File permissions for the output file
 
 ## 🔒 Security Best Practices
 
@@ -173,6 +179,8 @@ The Vault Secret Agent includes several performance optimizations:
 4. **Controlled Concurrency**: Manages parallel requests to balance between performance and API rate limits.
 
 5. **Response Compression**: Supports gzip compression for API responses to reduce bandwidth usage.
+
+6. **Caching with TTL**: Implements an in-memory cache with configurable Time-To-Live (TTL) for secrets, reducing API calls and improving response times while ensuring data freshness.
 
 ## 🤝 Contributing
 

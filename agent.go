@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -14,52 +16,42 @@ import (
 
 // AgentConfig represents the top-level configuration
 type AgentConfig struct {
+	HCPAuth struct {
+		ClientID       string `yaml:"client_id"`
+		ClientSecret   string `yaml:"client_secret"`
+		OrganizationID string `yaml:"organization_id"`
+		ProjectID      string `yaml:"project_id"`
+		AppName        string `yaml:"app_name"`
+	} `yaml:"hcp_auth"`
+
 	Agent struct {
-		HCP       HCPConfig        `yaml:"hcp"`
-		Settings  AgentSettings    `yaml:"settings"`
-		Logging   LoggingConfig    `yaml:"logging"`
-		Templates []TemplateConfig `yaml:"templates"`
+		RenderInterval time.Duration `yaml:"render_interval"`
+		NoExitOnRetry  bool          `yaml:"no_exit_on_retry"`
+		Retry          struct {
+			MaxAttempts    int           `yaml:"max_attempts"`
+			InitialBackoff time.Duration `yaml:"initial_backoff"`
+			MaxBackoff     time.Duration `yaml:"max_backoff"`
+			UseJitter      bool          `yaml:"use_jitter"`
+		} `yaml:"retry"`
+		Cache struct {
+			Enabled bool          `yaml:"enabled"`
+			TTL     time.Duration `yaml:"ttl"`
+		} `yaml:"cache"`
 	} `yaml:"agent"`
-}
 
-// HCPConfig contains HCP authentication settings
-type HCPConfig struct {
-	ClientID       string `yaml:"client_id"`
-	ClientSecret   string `yaml:"client_secret"`
-	OrganizationID string `yaml:"organization_id"`
-	ProjectID      string `yaml:"project_id"`
-	AppName        string `yaml:"app_name"`
-}
+	Logging struct {
+		Level       string `yaml:"level"`
+		Format      string `yaml:"format"`
+		MaskSecrets bool   `yaml:"mask_secrets"`
+	} `yaml:"logging"`
 
-// AgentSettings contains agent behavior configuration
-type AgentSettings struct {
-	RenderInterval     time.Duration `yaml:"render_interval"`
-	ExitOnRetryFailure bool          `yaml:"exit_on_retry_failure"`
-	Retry              RetryConfig   `yaml:"retry"`
-}
-
-// RetryConfig contains retry settings
-type RetryConfig struct {
-	MaxAttempts    int           `yaml:"max_attempts"`
-	BackoffInitial time.Duration `yaml:"backoff_initial"`
-	BackoffMax     time.Duration `yaml:"backoff_max"`
-	Jitter         bool          `yaml:"jitter"`
-}
-
-// LoggingConfig contains logging settings
-type LoggingConfig struct {
-	Level       string `yaml:"level"`
-	Format      string `yaml:"format"`
-	MaskSecrets bool   `yaml:"mask_secrets"`
-}
-
-// TemplateConfig contains template rendering settings
-type TemplateConfig struct {
-	Source            string `yaml:"source"`
-	Destination       string `yaml:"destination"`
-	ErrorOnMissingKey bool   `yaml:"error_on_missing_key"`
-	CreateDirectories bool   `yaml:"create_directories"`
-	Permissions       string `yaml:"permissions"`
+	Templates []struct {
+		Source             string      `yaml:"source"`
+		Destination        string      `yaml:"destination"`
+		ErrorOnMissingKeys bool        `yaml:"error_on_missing_keys"`
+		CreateDir          bool        `yaml:"create_dir"`
+		FilePerms          os.FileMode `yaml:"file_perms"`
+	} `yaml:"templates"`
 }
 
 // Agent represents the vault-secret-agent process
@@ -140,44 +132,55 @@ func NewAgent(configPath string) (*Agent, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create client
-	client, err := newClient(config.Agent.Logging.Level == "debug")
+	client, err := newClient(config.Logging.Level == "debug")
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error creating client: %w", err)
 	}
 
 	// Set client fields from config
-	client.orgID = config.Agent.HCP.OrganizationID
-	client.projectID = config.Agent.HCP.ProjectID
-	client.appName = config.Agent.HCP.AppName
+	client.orgID = config.HCPAuth.OrganizationID
+	client.projectID = config.HCPAuth.ProjectID
+	client.appName = config.HCPAuth.AppName
+
+	// Configure client cache
+	client.SetCacheConfig(CacheConfig{
+		Enabled: config.Agent.Cache.Enabled,
+		TTL:     config.Agent.Cache.TTL,
+	})
 
 	// Get initial access token
-	token, err := client.getAccessToken(config.Agent.HCP.ClientID, config.Agent.HCP.ClientSecret)
+	token, err := client.getAccessToken(config.HCPAuth.ClientID, config.HCPAuth.ClientSecret)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error getting initial access token: %w", err)
 	}
 	client.accessToken = token
 
-	return &Agent{
+	agent := &Agent{
 		config: config,
 		client: client,
 		ctx:    ctx,
 		cancel: cancel,
-	}, nil
+	}
+
+	// Start cache cleanup in background
+	go client.startCacheCleanup(ctx, time.Minute)
+
+	return agent, nil
 }
 
 // Start begins the agent process
 func (a *Agent) Start() error {
 	// Validate templates
-	for _, tmpl := range a.config.Agent.Templates {
+	for _, tmpl := range a.config.Templates {
 		if err := a.validateTemplate(tmpl); err != nil {
 			return fmt.Errorf("template validation error: %w", err)
 		}
 	}
 
 	// Start template processors
-	for _, tmpl := range a.config.Agent.Templates {
+	for _, tmpl := range a.config.Templates {
 		a.wg.Add(1)
 		go a.processTemplate(tmpl)
 	}
@@ -192,14 +195,20 @@ func (a *Agent) Stop() {
 }
 
 // validateTemplate checks if template configuration is valid
-func (a *Agent) validateTemplate(tmpl TemplateConfig) error {
+func (a *Agent) validateTemplate(tmpl struct {
+	Source             string      `yaml:"source"`
+	Destination        string      `yaml:"destination"`
+	ErrorOnMissingKeys bool        `yaml:"error_on_missing_keys"`
+	CreateDir          bool        `yaml:"create_dir"`
+	FilePerms          os.FileMode `yaml:"file_perms"`
+}) error {
 	// Check if source exists
 	if _, err := os.Stat(tmpl.Source); err != nil {
 		return fmt.Errorf("template source error: %w", err)
 	}
 
 	// Check if destination directory exists or can be created
-	if tmpl.CreateDirectories {
+	if tmpl.CreateDir {
 		dir := filepath.Dir(tmpl.Destination)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create destination directory: %w", err)
@@ -210,10 +219,16 @@ func (a *Agent) validateTemplate(tmpl TemplateConfig) error {
 }
 
 // processTemplate handles the continuous rendering of a template
-func (a *Agent) processTemplate(tmpl TemplateConfig) {
+func (a *Agent) processTemplate(tmpl struct {
+	Source             string      `yaml:"source"`
+	Destination        string      `yaml:"destination"`
+	ErrorOnMissingKeys bool        `yaml:"error_on_missing_keys"`
+	CreateDir          bool        `yaml:"create_dir"`
+	FilePerms          os.FileMode `yaml:"file_perms"`
+}) {
 	defer a.wg.Done()
 
-	ticker := time.NewTicker(a.config.Agent.Settings.RenderInterval)
+	ticker := time.NewTicker(a.config.Agent.RenderInterval)
 	defer ticker.Stop()
 
 	for {
@@ -225,12 +240,13 @@ func (a *Agent) processTemplate(tmpl TemplateConfig) {
 			fmt.Printf("Processing template %s -> %s\n", tmpl.Source, tmpl.Destination)
 
 			if err := a.renderTemplate(tmpl); err != nil {
-				if a.config.Agent.Settings.ExitOnRetryFailure {
+				if a.config.Agent.NoExitOnRetry {
+					fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
+				} else {
 					fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
 					a.Stop()
 					return
 				}
-				fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
 			} else {
 				fmt.Printf("Successfully rendered template %s\n", tmpl.Source)
 			}
@@ -239,8 +255,42 @@ func (a *Agent) processTemplate(tmpl TemplateConfig) {
 }
 
 // renderTemplate renders a single template
-func (a *Agent) renderTemplate(tmpl TemplateConfig) error {
+func (a *Agent) renderTemplate(tmpl struct {
+	Source             string      `yaml:"source"`
+	Destination        string      `yaml:"destination"`
+	ErrorOnMissingKeys bool        `yaml:"error_on_missing_keys"`
+	CreateDir          bool        `yaml:"create_dir"`
+	FilePerms          os.FileMode `yaml:"file_perms"`
+}) error {
 	// Log start of template rendering
 	fmt.Printf("Starting template rendering process for %s\n", tmpl.Source)
 	return a.client.processTemplate(a.ctx, tmpl.Source, tmpl.Destination)
+}
+
+// Run starts the agent with the provided context
+func (a *Agent) Run(ctx context.Context) error {
+	// Merge the provided context with our internal one
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Set up signal handling
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start the agent
+	if err := a.Start(); err != nil {
+		return err
+	}
+
+	// Wait for signal or context cancellation
+	select {
+	case <-runCtx.Done():
+		fmt.Println("Context cancelled, shutting down...")
+	case sig := <-sigCh:
+		fmt.Printf("Received signal %s, shutting down...\n", sig)
+	}
+
+	// Stop the agent
+	a.Stop()
+	return nil
 }
