@@ -254,6 +254,7 @@ func (c *Cache) Size() int {
 	return len(c.secrets)
 }
 
+// Client represents an API client for HCP Vault Secrets
 type Client struct {
 	baseURL     string
 	httpClient  *retryablehttp.Client
@@ -264,6 +265,8 @@ type Client struct {
 	projectID   string
 	appName     string
 	cache       *Cache
+	templates   map[string]*CompiledTemplate
+	templateMu  sync.RWMutex
 }
 
 type AccessTokenResponse struct {
@@ -272,6 +275,7 @@ type AccessTokenResponse struct {
 	TokenType   string `json:"token_type"`
 }
 
+// SecretResponse represents a secret response from the API
 type SecretResponse struct {
 	Name     string
 	Value    string
@@ -323,6 +327,14 @@ type CacheConfig struct {
 	TTL     time.Duration `yaml:"ttl"`
 }
 
+// CompiledTemplate represents a pre-compiled template
+type CompiledTemplate struct {
+	Source     string
+	Variables  []string
+	Content    string
+	CompiledAt time.Time
+}
+
 var (
 	verbose     bool
 	response    bool
@@ -350,6 +362,7 @@ func init() {
 	flag.BoolVar(&showVersion, "v", false, "Show version information")
 }
 
+// newClient creates a new API client
 func newClient(verbose bool) (*Client, error) {
 	// Get required environment variables
 	clientID := os.Getenv("HCP_CLIENT_ID")
@@ -393,6 +406,7 @@ func newClient(verbose bool) (*Client, error) {
 		projectID:  projectID,
 		appName:    appName,
 		cache:      NewCache(defaultTTL, true), // Enable caching by default with default TTL
+		templates:  make(map[string]*CompiledTemplate),
 	}
 
 	// Get access token
@@ -775,12 +789,14 @@ func bufferOutput(path string) (*bufio.Writer, *os.File, error) {
 	return bufio.NewWriterSize(file, 32*1024), file, nil // 32KB buffer
 }
 
-// processTemplate reads template file, extracts variables, fetches secrets, and writes output
-func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
+// compileTemplate reads a template file, extracts variables, and returns a compiled template
+func (c *Client) compileTemplate(templatePath string) (*CompiledTemplate, error) {
+	c.logf("Compiling template: %s", templatePath)
+
 	// Read template file
 	tmplData, err := os.ReadFile(templatePath)
 	if err != nil {
-		return fmt.Errorf("failed to read template: %w", err)
+		return nil, fmt.Errorf("failed to read template: %w", err)
 	}
 
 	// Find all variables in template
@@ -792,13 +808,59 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 	}
 
 	if len(variables) == 0 {
-		return fmt.Errorf("no variables found in template")
+		return nil, fmt.Errorf("no variables found in template")
 	}
 
 	c.logf("Found %d variables in template: %v", len(variables), variables)
 
+	// Create compiled template
+	compiledTemplate := &CompiledTemplate{
+		Source:     templatePath,
+		Variables:  variables,
+		Content:    string(tmplData),
+		CompiledAt: time.Now(),
+	}
+
+	return compiledTemplate, nil
+}
+
+// getCompiledTemplate returns a compiled template, either from cache or by compiling it
+func (c *Client) getCompiledTemplate(templatePath string) (*CompiledTemplate, error) {
+	// Check if template is already compiled and cached
+	c.templateMu.RLock()
+	compiledTemplate, exists := c.templates[templatePath]
+	c.templateMu.RUnlock()
+
+	if exists {
+		c.logf("Using cached compiled template for %s", templatePath)
+		return compiledTemplate, nil
+	}
+
+	// Compile the template
+	compiledTemplate, err := c.compileTemplate(templatePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the compiled template
+	c.templateMu.Lock()
+	c.templates[templatePath] = compiledTemplate
+	c.templateMu.Unlock()
+
+	c.logf("Cached compiled template for %s", templatePath)
+	return compiledTemplate, nil
+}
+
+// processTemplate reads template file, extracts variables, fetches secrets, and writes output
+func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
+	// Get compiled template
+	compiledTemplate, err := c.getCompiledTemplate(templatePath)
+	if err != nil {
+		return fmt.Errorf("failed to get compiled template: %w", err)
+	}
+
 	// Get all secrets concurrently using getSecrets
-	secrets := c.getSecrets(ctx, variables)
+	secrets := c.getSecrets(ctx, compiledTemplate.Variables)
 
 	// Check for errors
 	var errs []string
@@ -816,7 +878,7 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 	}
 
 	// Replace variables in template
-	result := string(tmplData)
+	result := compiledTemplate.Content
 	for name, value := range values {
 		placeholder := fmt.Sprintf("{{ %s }}", name)
 		result = strings.ReplaceAll(result, placeholder, value)

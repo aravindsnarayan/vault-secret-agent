@@ -231,11 +231,29 @@ func (a *Agent) processTemplate(tmpl struct {
 	ticker := time.NewTicker(a.config.Agent.RenderInterval)
 	defer ticker.Stop()
 
+	// Track the last modified time of the template file
+	var lastModTime time.Time
+
+	// Initial check of template file modification time
+	if fileInfo, err := os.Stat(tmpl.Source); err == nil {
+		lastModTime = fileInfo.ModTime()
+	}
+
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
+			// Check if template file has been modified
+			if fileInfo, err := os.Stat(tmpl.Source); err == nil {
+				currentModTime := fileInfo.ModTime()
+				if currentModTime.After(lastModTime) {
+					// Template file has changed, invalidate cache
+					a.invalidateTemplateCache(tmpl.Source)
+					lastModTime = currentModTime
+				}
+			}
+
 			// Log template processing start
 			fmt.Printf("Processing template %s -> %s\n", tmpl.Source, tmpl.Destination)
 
@@ -252,6 +270,15 @@ func (a *Agent) processTemplate(tmpl struct {
 			}
 		}
 	}
+}
+
+// invalidateTemplateCache removes a template from the cache to force recompilation
+func (a *Agent) invalidateTemplateCache(templatePath string) {
+	a.client.templateMu.Lock()
+	defer a.client.templateMu.Unlock()
+
+	delete(a.client.templates, templatePath)
+	fmt.Printf("Invalidated template cache for %s\n", templatePath)
 }
 
 // renderTemplate renders a single template

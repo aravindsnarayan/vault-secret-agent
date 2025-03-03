@@ -28,6 +28,8 @@ cleanup() {
     fi
     # Remove cache test files
     rm -f cache-test.tmpl cache-test.env cache-config.yaml cache-test.log
+    # Remove pre-compilation test files
+    rm -f precompile-test.tmpl precompile-test.env
     print_success "Test artifacts removed"
 }
 
@@ -324,6 +326,42 @@ EOF
     print_header "Testing batch requests"
     ./vault-secret-agent -vvv FG_RELEASE_VERSION FG_ASSET_VERSION FG_CURRENT_SPRINT 2>&1 | grep "batch" | head -n 2
     print_success "Batch request mode working"
+    
+    # Test template pre-compilation
+    print_header "Testing template pre-compilation"
+    # Create test template for pre-compilation test
+    cat > precompile-test.tmpl << 'EOF'
+FG_RELEASE_VERSION='{{ FG_RELEASE_VERSION }}'
+FG_ASSET_VERSION='{{ FG_ASSET_VERSION }}'
+FG_CURRENT_SPRINT='{{ FG_CURRENT_SPRINT }}'
+EOF
+    print_success "Pre-compilation test template created"
+    
+    # First run - should compile the template
+    echo "First run - should compile the template"
+    ./vault-secret-agent -vvv -t precompile-test.tmpl -o precompile-test.env 2>&1 | grep -E "Compiling template|Found .* variables in template|Cached compiled template" | head -n 3
+    
+    # Second run - should use the cached template
+    echo "Second run - should use the cached template"
+    ./vault-secret-agent -vvv -t precompile-test.tmpl -o precompile-test.env 2>&1 | grep "Using cached compiled template" | head -n 1
+    
+    # Modify the template
+    echo "Modifying the template to test cache invalidation"
+    cat > precompile-test.tmpl << 'EOF'
+FG_RELEASE_VERSION='{{ FG_RELEASE_VERSION }}'
+FG_ASSET_VERSION='{{ FG_ASSET_VERSION }}'
+FG_CURRENT_SPRINT='{{ FG_CURRENT_SPRINT }}'
+FG_URL_HOST='{{ FG_URL_HOST }}'
+EOF
+    
+    # Third run - should recompile the template
+    echo "Third run - should recompile the template after modification"
+    ./vault-secret-agent -vvv -t precompile-test.tmpl -o precompile-test.env 2>&1 | grep -E "Compiling template|Found .* variables in template|Cached compiled template" | head -n 3
+    
+    print_success "Template pre-compilation working correctly"
+    
+    # Clean up pre-compilation test files
+    rm -f precompile-test.tmpl precompile-test.env
 else
     print_header "Skipping API tests - environment variables not set"
     echo "To run API tests, set the following environment variables:"

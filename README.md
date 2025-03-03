@@ -182,6 +182,8 @@ The Vault Secret Agent includes several performance optimizations:
 
 6. **Caching with TTL**: Implements an in-memory cache with configurable Time-To-Live (TTL) for secrets, reducing API calls and improving response times while ensuring data freshness.
 
+7. **Template Pre-compilation**: Parses and compiles templates only once, caching the results for subsequent renderings. Templates are automatically recompiled if the source file changes.
+
 ## 🤝 Contributing
 
 1. Fork the repository
