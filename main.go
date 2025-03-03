@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -604,6 +605,15 @@ func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretRespon
 	return results
 }
 
+// bufferOutput creates a buffered writer for the given file path
+func bufferOutput(path string) (*bufio.Writer, *os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open output file: %w", err)
+	}
+	return bufio.NewWriterSize(file, 32*1024), file, nil // 32KB buffer
+}
+
 // processTemplate reads template file, extracts variables, fetches secrets, and writes output
 func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
 	// Read template file
@@ -651,12 +661,24 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 		result = strings.ReplaceAll(result, placeholder, value)
 	}
 
-	// Write output file with secure permissions
-	if err := os.WriteFile(outputPath, []byte(result), 0600); err != nil {
-		return fmt.Errorf("failed to write output: %w", err)
+	// Use buffered output for writing the file
+	writer, file, err := bufferOutput(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+
+	// Write to buffer
+	if _, err := writer.WriteString(result); err != nil {
+		return fmt.Errorf("failed to write to buffer: %w", err)
 	}
 
-	c.logf("Successfully rendered template and wrote output to %s", outputPath)
+	// Flush buffer to disk
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush buffer: %w", err)
+	}
+
+	c.logf("Successfully wrote output to %s", outputPath)
 	return nil
 }
 
@@ -679,9 +701,14 @@ func main() {
 
 	flag.Parse()
 
+	// Create buffered stdout writer
+	stdoutBuf := bufio.NewWriterSize(os.Stdout, 16*1024)
+	defer stdoutBuf.Flush()
+
 	// Handle version flag
 	if showVersion {
-		fmt.Printf("vault-secret-agent version %s\n", version)
+		fmt.Fprintf(stdoutBuf, "vault-secret-agent version %s\n", version)
+		stdoutBuf.Flush()
 		os.Exit(0)
 	}
 
@@ -779,34 +806,44 @@ func main() {
 					os.Exit(1)
 				}
 
-				fmt.Println(string(jsonBytes))
+				// Write JSON to buffered stdout
+				fmt.Fprintf(stdoutBuf, "%s\n", jsonBytes)
 			} else {
-				fmt.Printf("%s=%s\n", secret.Name, secret.Value)
+				// Write key=value to buffered stdout
+				fmt.Fprintf(stdoutBuf, "%s=%s\n", secret.Name, secret.Value)
 			}
 		}
-	} else {
-		// Use getSecret for a single secret
-		secret, err := client.getSecret(ctx, secretNames[0])
+		// Flush buffer at the end
+		stdoutBuf.Flush()
+		return
+	}
+
+	// Single secret case
+	secret, err := client.getSecret(ctx, secretNames[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting secret: %v\n", err)
+		os.Exit(1)
+	}
+
+	if response {
+		// Create a map for response output
+		output := make(map[string]interface{})
+		output[secret.Name] = secret.Response
+
+		// Marshal to JSON
+		jsonBytes, err := json.MarshalIndent(output, "", "  ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting secret: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
 			os.Exit(1)
 		}
 
-		if response {
-			// Create a map for response output
-			output := make(map[string]interface{})
-			output[secretNames[0]] = secret.Response
-
-			// Marshal to JSON
-			jsonBytes, err := json.MarshalIndent(output, "", "  ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
-				os.Exit(1)
-			}
-
-			fmt.Println(string(jsonBytes))
-		} else {
-			fmt.Printf("%s=%s\n", secretNames[0], secret.Value)
-		}
+		// Write JSON to buffered stdout
+		fmt.Fprintf(stdoutBuf, "%s\n", jsonBytes)
+	} else {
+		// Write key=value to buffered stdout
+		fmt.Fprintf(stdoutBuf, "%s=%s\n", secret.Name, secret.Value)
 	}
+
+	// Flush buffer at the end
+	stdoutBuf.Flush()
 }

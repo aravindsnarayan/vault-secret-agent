@@ -19,6 +19,12 @@ A powerful and flexible tool for managing secrets from HashiCorp Cloud Platform 
   - Secure file permissions
   - Environment variable support for credentials
 
+- **Performance Optimizations**:
+  - Output buffering for faster processing
+  - Batch request mode for multiple secrets
+  - Connection pooling for efficient API usage
+  - Controlled concurrency for large secret sets
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -153,6 +159,20 @@ Run as a background service that automatically updates secrets:
 3. Enable secret masking in logs
 4. Regularly rotate HCP credentials
 5. Use the minimum required permissions
+
+## 🚀 Performance Optimizations
+
+The Vault Secret Agent includes several performance optimizations:
+
+1. **Output Buffering**: Significantly improves performance when processing large templates or multiple secrets by buffering output operations.
+
+2. **Batch Request Mode**: Retrieves multiple secrets in a single API call, reducing network overhead and improving response times.
+
+3. **Connection Pooling**: Reuses HTTP connections to minimize connection establishment overhead for multiple requests.
+
+4. **Controlled Concurrency**: Manages parallel requests to balance between performance and API rate limits.
+
+5. **Response Compression**: Supports gzip compression for API responses to reduce bandwidth usage.
 
 ## 🤝 Contributing
 
