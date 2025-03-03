@@ -155,14 +155,24 @@ func newClient(verbose bool) (*Client, error) {
 		return nil, fmt.Errorf("HCP_CLIENT_ID, HCP_CLIENT_SECRET, HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set")
 	}
 
-	// Create retryable HTTP client
+	// Create transport with connection pooling
+	transport := &http.Transport{
+		MaxIdleConns:        100,              // Maximum number of idle connections
+		MaxIdleConnsPerHost: 10,               // Maximum number of idle connections per host
+		IdleConnTimeout:     90 * time.Second, // How long to keep idle connections alive
+		DisableCompression:  false,            // Enable compression for better performance
+		ForceAttemptHTTP2:   true,             // Prefer HTTP/2 when available
+	}
+
+	// Create retryable HTTP client with pooled transport
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = 3
 	retryClient.Logger = nil // Disable internal logging
+	retryClient.HTTPClient.Transport = transport
 
 	// Create client
 	client := &Client{
-		baseURL:    "https://api.cloud.hashicorp.com/secrets/2023-11-28",
+		baseURL:    hcpAPIBaseURL,
 		httpClient: retryClient,
 		verbose:    verbose,
 		logger:     log.New(os.Stderr, "vault-secret-agent: ", log.LstdFlags),
