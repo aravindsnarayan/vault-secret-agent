@@ -3,6 +3,7 @@
 # Colors for output
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Function to print test results
@@ -313,6 +314,15 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
         exit 1
     fi
     export HCP_PROJECT_ID=$OLD_PROJECT_ID
+
+    # Test response compression
+    echo "Testing response compression..."
+    ./vault-secret-agent -vvv FG_RELEASE_VERSION 2>&1 | tee output.log
+    if grep -q "Response compressed.*bytes" output.log || grep -q "Content-Encoding: gzip" output.log; then
+        print_result "Response compression is working"
+    else
+        echo -e "${YELLOW}! Response compression not detected (server may not support it)${NC}"
+    fi
 else
     echo -e "\n5. Skipping API tests - environment variables not set"
 fi

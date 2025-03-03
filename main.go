@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"compress/gzip"
+
 	"github.com/hashicorp/go-retryablehttp"
 )
 
@@ -356,6 +358,9 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
 	req.Header.Set("X-Request-ID", reqID)
 
+	// Add Accept-Encoding header for compression
+	req.Header.Set("Accept-Encoding", "gzip")
+
 	// Log request attempt
 	c.logf("[%s] Making request to %s", reqID, maskURL(req.URL.String()))
 
@@ -363,6 +368,29 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 	if err != nil {
 		c.logf("[%s] Request failed: %v", reqID, err)
 		return nil, err
+	}
+
+	// Handle gzip compressed responses
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		resp.Body = io.NopCloser(reader)
+		if c.verbose {
+			c.logf("[%s] Decompressing gzip response", reqID)
+		}
+	}
+
+	// Log compression info if verbose
+	if c.verbose && resp.Header.Get("Content-Encoding") != "" {
+		originalSize := resp.Header.Get("X-Original-Content-Length")
+		if originalSize != "" {
+			compressedSize := resp.Header.Get("Content-Length")
+			c.logf("[%s] Response compressed: %s -> %s bytes (%s encoding)",
+				reqID, originalSize, compressedSize, resp.Header.Get("Content-Encoding"))
+		}
 	}
 
 	// Handle various status codes that warrant retries
