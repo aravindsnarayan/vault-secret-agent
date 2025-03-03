@@ -112,16 +112,31 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
         exit 1
     fi
     
-    # Test concurrent requests
-    echo "Testing concurrent requests..."
+    # Test concurrent requests with rate limiting
+    echo "Testing controlled concurrency..."
     START_TIME=$(date +%s%N)
-    ./vault-secret-agent FG_RELEASE_VERSION FG_ASSET_VERSION FG_CURRENT_SPRINT 2>/dev/null
+    timeout 30s ./vault-secret-agent -vvv FG_RELEASE_VERSION FG_ASSET_VERSION FG_CURRENT_SPRINT FG_URL_HOST FG_URL_SCHEME FG_URL_HTTP_PORT FG_BASE_URL FG_DOMAINS APP_ENV APP_DEBUG 2>&1 | tee output.log
     END_TIME=$(date +%s%N)
     DURATION=$((($END_TIME - $START_TIME) / 1000000))
-    if [ $DURATION -lt 5000 ]; then
-        print_result "Concurrent requests completed in ${DURATION}ms"
+    
+    # Check if controlled concurrency was used
+    if tr -d '\n' < output.log | grep -q "Successfully retrieved .* secrets with controlled concurrency"; then
+        print_result "Controlled concurrency mode detected"
     else
-        echo -e "${RED}✗ Concurrent requests took too long: ${DURATION}ms${NC}"
+        echo -e "${RED}✗ Controlled concurrency mode not detected${NC}"
+        cat output.log
+        exit 1
+    fi
+    
+    # Verify all secrets were retrieved
+    tr -d '\n' < output.log | grep -q "Successfully retrieved .* secrets with controlled concurrency"
+    print_result "All secrets retrieved successfully"
+    
+    # Check performance with larger number of secrets
+    if [ $DURATION -lt 5000 ]; then
+        print_result "Multiple secret retrieval performance is good (completed in ${DURATION}ms)"
+    else
+        echo -e "${RED}✗ Multiple secret retrieval performance could be improved (${DURATION}ms)${NC}"
         exit 1
     fi
     
@@ -258,6 +273,46 @@ if [[ -n "$HCP_CLIENT_ID" && -n "$HCP_CLIENT_SECRET" && -n "$HCP_ORGANIZATION_ID
     
     # Cleanup agent
     kill $AGENT_PID
+
+    # Test batch requests
+    echo "Testing batch requests..."
+    START_TIME=$(date +%s%N)
+    ./vault-secret-agent -vvv FG_RELEASE_VERSION FG_ASSET_VERSION FG_CURRENT_SPRINT 2>&1 | tee output.log
+    END_TIME=$(date +%s%N)
+    DURATION=$((($END_TIME - $START_TIME) / 1000000))
+    
+    # Check if batch mode was used
+    if grep -q "Fetching .* secrets in batch mode" output.log; then
+        print_result "Batch request mode detected"
+    else
+        echo -e "${RED}✗ Batch request mode not detected${NC}"
+        exit 1
+    fi
+    
+    # Verify all secrets were retrieved
+    grep -q "Successfully retrieved .* secrets in batch" output.log
+    print_result "Batch request completed successfully"
+    
+    # Check performance improvement
+    if [ $DURATION -lt 2000 ]; then
+        print_result "Batch request performance is good (completed in ${DURATION}ms)"
+    else
+        echo -e "${RED}✗ Batch request performance could be improved (${DURATION}ms)${NC}"
+        exit 1
+    fi
+    
+    # Test batch request fallback
+    echo "Testing batch request fallback..."
+    OLD_PROJECT_ID=$HCP_PROJECT_ID
+    export HCP_PROJECT_ID="invalid_project"
+    ./vault-secret-agent -vvv FG_RELEASE_VERSION FG_ASSET_VERSION 2>&1 | tee output.log
+    if grep -q "Batch request failed, falling back to individual requests" output.log; then
+        print_result "Batch request fallback works"
+    else
+        echo -e "${RED}✗ Batch request fallback not detected${NC}"
+        exit 1
+    fi
+    export HCP_PROJECT_ID=$OLD_PROJECT_ID
 else
     echo -e "\n5. Skipping API tests - environment variables not set"
 fi

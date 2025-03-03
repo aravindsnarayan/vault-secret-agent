@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -185,6 +186,31 @@ type SecretResult struct {
 	Value    string
 	Error    error
 	Response *SecretResponse
+}
+
+// BatchSecretRequest represents a batch request for multiple secrets
+type BatchSecretRequest struct {
+	Names []string `json:"names"`
+}
+
+// BatchSecretResponse represents the response from a batch request
+type BatchSecretResponse struct {
+	Secrets map[string]struct {
+		Secret struct {
+			Name          string    `json:"name"`
+			Type          string    `json:"type"`
+			LatestVersion int       `json:"latest_version"`
+			CreatedAt     time.Time `json:"created_at"`
+			CreatedByID   string    `json:"created_by_id"`
+			SyncStatus    struct{}  `json:"sync_status"`
+			StaticVersion struct {
+				Version     int       `json:"version"`
+				Value       string    `json:"value"`
+				CreatedAt   time.Time `json:"created_at"`
+				CreatedByID string    `json:"created_by_id"`
+			} `json:"static_version"`
+		} `json:"secret"`
+	} `json:"secrets"`
 }
 
 var (
@@ -443,14 +469,96 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 	}, nil
 }
 
+// getSecretsInBatch fetches multiple secrets in a single API call
+func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*SecretResponse, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	c.logf("Fetching %d secrets in batch mode", len(names))
+
+	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets:batchOpen",
+		hcpAPIBaseURL, c.orgID, c.projectID, c.appName)
+
+	// Create batch request
+	batchReq := BatchSecretRequest{
+		Names: names,
+	}
+
+	reqBody, err := json.Marshal(batchReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal batch request: %w", err)
+	}
+
+	req, err := retryablehttp.NewRequest("POST", url, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create batch request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+
+	// Use context
+	req.WithContext(ctx)
+
+	resp, err := c.doWithRetry(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make batch request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("batch request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var batchResp BatchSecretResponse
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+		return nil, fmt.Errorf("failed to decode batch response: %w", err)
+	}
+
+	// Convert batch response to SecretResponse array
+	results := make([]*SecretResponse, len(names))
+	for i, name := range names {
+		if secretData, ok := batchResp.Secrets[name]; ok {
+			results[i] = &SecretResponse{
+				Name:     name,
+				Value:    secretData.Secret.StaticVersion.Value,
+				Response: secretData,
+			}
+		} else {
+			results[i] = &SecretResponse{
+				Name:  name,
+				Error: fmt.Errorf("secret not found in batch response"),
+			}
+		}
+	}
+
+	c.logf("Successfully retrieved %d secrets in batch", len(names))
+	return results, nil
+}
+
 func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretResponse {
 	results := make([]*SecretResponse, len(names))
 	var wg sync.WaitGroup
+
+	// Create a semaphore to limit concurrent requests
+	semaphore := make(chan struct{}, 5) // Allow up to 5 concurrent requests
+
+	c.logf("Fetching %d secrets with controlled concurrency", len(names))
 
 	for i, name := range names {
 		wg.Add(1)
 		go func(i int, name string) {
 			defer wg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() {
+				// Release semaphore
+				<-semaphore
+			}()
+
 			secret, err := c.getSecret(ctx, name)
 			if err != nil {
 				results[i] = &SecretResponse{
@@ -464,6 +572,7 @@ func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretRespon
 	}
 
 	wg.Wait()
+	c.logf("Successfully retrieved %d secrets with controlled concurrency", len(names))
 	return results
 }
 
@@ -621,8 +730,35 @@ func main() {
 
 	// Process each secret
 	secretNames := flag.Args()
-	for _, name := range secretNames {
-		secret, err := client.getSecret(ctx, name)
+	if len(secretNames) > 1 {
+		// Use getSecrets for multiple secrets
+		secrets := client.getSecrets(ctx, secretNames)
+		for _, secret := range secrets {
+			if secret.Error != nil {
+				fmt.Fprintf(os.Stderr, "Error getting secret %q: %v\n", secret.Name, secret.Error)
+				os.Exit(1)
+			}
+
+			if response {
+				// Create a map for response output
+				output := make(map[string]interface{})
+				output[secret.Name] = secret.Response
+
+				// Marshal to JSON
+				jsonBytes, err := json.MarshalIndent(output, "", "  ")
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
+					os.Exit(1)
+				}
+
+				fmt.Println(string(jsonBytes))
+			} else {
+				fmt.Printf("%s=%s\n", secret.Name, secret.Value)
+			}
+		}
+	} else {
+		// Use getSecret for a single secret
+		secret, err := client.getSecret(ctx, secretNames[0])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting secret: %v\n", err)
 			os.Exit(1)
@@ -631,7 +767,7 @@ func main() {
 		if response {
 			// Create a map for response output
 			output := make(map[string]interface{})
-			output[name] = secret.Response
+			output[secretNames[0]] = secret.Response
 
 			// Marshal to JSON
 			jsonBytes, err := json.MarshalIndent(output, "", "  ")
@@ -642,7 +778,7 @@ func main() {
 
 			fmt.Println(string(jsonBytes))
 		} else {
-			fmt.Printf("%s=%s\n", name, secret.Value)
+			fmt.Printf("%s=%s\n", secretNames[0], secret.Value)
 		}
 	}
 }
