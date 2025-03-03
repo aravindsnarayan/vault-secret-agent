@@ -18,6 +18,7 @@ A powerful and flexible tool for managing secrets from HashiCorp Cloud Platform 
   - Automatic secret masking in logs
   - Secure file permissions
   - Environment variable support for credentials
+  - Memory security to protect sensitive data
 
 - **Performance Optimizations**:
   - Output buffering for faster processing
@@ -130,7 +131,7 @@ Run as a background service that automatically updates secrets:
 - `-r, --response`: Show full API response
 - `-t, --template=<file>`: Template file to process
 - `-v, --version`: Show version information
-- `-vvv, --verbose`: Enable verbose logging
+- `-V, --verbose`: Enable verbose logging
 
 ## 📝 Configuration
 
@@ -166,6 +167,40 @@ Run as a background service that automatically updates secrets:
 4. Regularly rotate HCP credentials
 5. Use the minimum required permissions
 
+## 🛡️ Memory Security
+
+The Vault Secret Agent implements advanced memory security features to protect sensitive data:
+
+### SecureString Implementation
+
+The `SecureString` type provides enhanced security for sensitive string data:
+
+- **Memory Zeroing**: Automatically zeroes memory when the string is no longer needed
+- **Copy Protection**: Minimizes unnecessary copying of sensitive data
+- **Finalizer Integration**: Uses Go's finalizer mechanism to ensure cleanup even when objects are garbage collected
+- **Controlled Access**: Provides methods for secure access to the underlying data
+
+### Memory Locking
+
+The agent uses memory locking to prevent sensitive data from being swapped to disk:
+
+- **mlock System Call**: Uses the system's memory locking capabilities to pin sensitive memory pages
+- **Automatic Management**: Locks memory at startup and unlocks it at shutdown
+- **Graceful Degradation**: Falls back gracefully if memory locking is not available or permitted
+
+### Usage Example
+
+```go
+// Create a secure string
+secret := NewSecureString("sensitive-data")
+
+// Use the secure string
+fmt.Println(secret.Get()) // Safely access the value
+
+// When done, explicitly destroy the secure string
+secret.Destroy()
+```
+
 ## 🚀 Performance Optimizations
 
 The Vault Secret Agent includes several performance optimizations:
@@ -183,6 +218,13 @@ The Vault Secret Agent includes several performance optimizations:
 6. **Caching with TTL**: Implements an in-memory cache with configurable Time-To-Live (TTL) for secrets, reducing API calls and improving response times while ensuring data freshness.
 
 7. **Template Pre-compilation**: Parses and compiles templates only once, caching the results for subsequent renderings. Templates are automatically recompiled if the source file changes.
+
+8. **Memory Security**: Implements comprehensive memory protection for sensitive data:
+   - **SecureString Type**: Custom type that stores sensitive strings in protected memory and zeroes the memory when garbage collected
+   - **Memory Locking**: Prevents sensitive memory pages from being swapped to disk, reducing the risk of secrets being written to persistent storage
+   - **Secure Cleanup**: Automatically cleans up sensitive data when it's no longer needed
+   - **Garbage Collection Integration**: Uses finalizers to ensure proper cleanup even when objects go out of scope
+   - **Zero-Copy Design**: Minimizes unnecessary copying of sensitive data in memory
 
 ## 🤝 Contributing
 

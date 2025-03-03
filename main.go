@@ -172,6 +172,14 @@ func NewCache(ttl time.Duration, enabled bool) *Cache {
 	if ttl <= 0 {
 		ttl = defaultTTL
 	}
+
+	// Try to lock memory to prevent swapping
+	if enabled {
+		if err := LockMemory(); err != nil {
+			log.Printf("Warning: Failed to lock memory: %v", err)
+		}
+	}
+
 	return &Cache{
 		secrets: make(map[string]CachedSecret),
 		ttl:     ttl,
@@ -221,6 +229,13 @@ func (c *Cache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Securely clear each secret before removing it
+	for _, cached := range c.secrets {
+		if cached.Secret != nil && cached.Secret.Value != nil {
+			cached.Secret.Value.Destroy()
+		}
+	}
+
 	c.secrets = make(map[string]CachedSecret)
 }
 
@@ -238,6 +253,10 @@ func (c *Cache) ClearExpired() int {
 
 	for name, cached := range c.secrets {
 		if now.After(cached.ExpiresAt) {
+			// Securely clear the secret before removing it
+			if cached.Secret != nil && cached.Secret.Value != nil {
+				cached.Secret.Value.Destroy()
+			}
 			delete(c.secrets, name)
 			count++
 		}
@@ -260,7 +279,7 @@ type Client struct {
 	httpClient  *retryablehttp.Client
 	verbose     bool
 	logger      *log.Logger
-	accessToken string
+	accessToken *SecureString
 	orgID       string
 	projectID   string
 	appName     string
@@ -278,7 +297,7 @@ type AccessTokenResponse struct {
 // SecretResponse represents a secret response from the API
 type SecretResponse struct {
 	Name     string
-	Value    string
+	Value    *SecureString
 	Response interface{}
 	Error    error
 }
@@ -343,78 +362,36 @@ var (
 	agentMode   bool
 	agentConfig string
 	showVersion bool
+	stdoutBuf   *bufio.Writer
 )
 
 func init() {
-	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
-	flag.BoolVar(&verbose, "vvv", false, "Enable verbose logging")
-	flag.BoolVar(&response, "response", false, "Output full API response")
-	flag.BoolVar(&response, "r", false, "Output full API response")
-	flag.StringVar(&template, "template", "", "Path to template file")
-	flag.StringVar(&template, "t", "", "Path to template file")
-	flag.StringVar(&output, "output", "", "Path to output file")
-	flag.StringVar(&output, "o", "", "Path to output file")
-	flag.BoolVar(&agentMode, "agent", false, "Run in agent mode")
-	flag.BoolVar(&agentMode, "a", false, "Run in agent mode")
-	flag.StringVar(&agentConfig, "config", "", "Path to agent configuration file")
-	flag.StringVar(&agentConfig, "c", "", "Path to agent configuration file")
-	flag.BoolVar(&showVersion, "version", false, "Show version information")
-	flag.BoolVar(&showVersion, "v", false, "Show version information")
+	// Flag definitions moved to main function with custom flagSet
 }
 
-// newClient creates a new API client
+// newClient creates a new client with the specified verbosity
 func newClient(verbose bool) (*Client, error) {
-	// Get required environment variables
-	clientID := os.Getenv("HCP_CLIENT_ID")
-	clientSecret := os.Getenv("HCP_CLIENT_SECRET")
-	orgID := os.Getenv("HCP_ORGANIZATION_ID")
-	projectID := os.Getenv("HCP_PROJECT_ID")
-	appName := os.Getenv("HCP_APP_NAME")
-
-	if clientID == "" || clientSecret == "" || orgID == "" || projectID == "" || appName == "" {
-		return nil, fmt.Errorf("HCP_CLIENT_ID, HCP_CLIENT_SECRET, HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set")
+	// Try to lock memory to prevent swapping
+	if err := LockMemory(); err != nil {
+		log.Printf("Warning: Failed to lock memory: %v", err)
 	}
 
-	// Create transport with optimized connection pooling
-	transport := &http.Transport{
-		MaxIdleConns:          100,              // Maximum number of idle connections
-		MaxIdleConnsPerHost:   20,               // Increased from 10 to 20 for better connection reuse
-		MaxConnsPerHost:       50,               // Limit total connections per host
-		IdleConnTimeout:       90 * time.Second, // How long to keep idle connections alive
-		TLSHandshakeTimeout:   10 * time.Second, // Timeout for TLS handshake
-		ExpectContinueTimeout: 1 * time.Second,  // Timeout for Expect: 100-continue
-		DisableCompression:    false,            // Enable compression for better performance
-		ForceAttemptHTTP2:     true,             // Prefer HTTP/2 when available
-	}
-
-	// Create retryable HTTP client with optimized settings
+	// Create retryable HTTP client
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = 3
-	retryClient.RetryWaitMin = 1 * time.Second
-	retryClient.RetryWaitMax = 30 * time.Second
-	retryClient.Logger = nil // Disable internal logging
-	retryClient.HTTPClient.Transport = transport
-	retryClient.HTTPClient.Timeout = 30 * time.Second // Set overall request timeout
+	retryClient.Logger = nil // Disable default logger
 
-	// Create client with default cache settings
+	// Create client
 	client := &Client{
 		baseURL:    hcpAPIBaseURL,
 		httpClient: retryClient,
 		verbose:    verbose,
-		logger:     log.New(os.Stderr, "vault-secret-agent: ", log.LstdFlags),
-		orgID:      orgID,
-		projectID:  projectID,
-		appName:    appName,
-		cache:      NewCache(defaultTTL, true), // Enable caching by default with default TTL
+		logger:     log.New(os.Stderr, "", log.LstdFlags),
 		templates:  make(map[string]*CompiledTemplate),
 	}
 
-	// Get access token
-	token, err := client.getAccessToken(clientID, clientSecret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get access token: %w", err)
-	}
-	client.accessToken = token
+	// Initialize cache with default TTL
+	client.cache = NewCache(defaultTTL, true)
 
 	return client, nil
 }
@@ -434,18 +411,19 @@ func (c *Client) logf(format string, v ...interface{}) {
 	}
 }
 
+// getAccessToken gets an access token from HCP
 func (c *Client) getAccessToken(clientID, clientSecret string) (string, error) {
-	c.logf("Getting access token from HCP auth service...")
+	c.logf("Getting access token from HCP...")
 
-	// Create request body with audience parameter
-	params := url.Values{}
-	params.Set("grant_type", "client_credentials")
-	params.Set("client_id", clientID)
-	params.Set("client_secret", clientSecret)
-	params.Set("audience", "https://api.hashicorp.cloud")
+	// Create form data
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	data.Set("audience", "https://api.hashicorp.cloud")
 
 	// Create request
-	req, err := retryablehttp.NewRequest("POST", authURL, strings.NewReader(params.Encode()))
+	req, err := http.NewRequest("POST", authURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -453,7 +431,7 @@ func (c *Client) getAccessToken(clientID, clientSecret string) (string, error) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	// Make request
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.StandardClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to make request: %w", err)
 	}
@@ -464,15 +442,18 @@ func (c *Client) getAccessToken(clientID, clientSecret string) (string, error) {
 		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-	}
-
+	// Parse response
+	var tokenResp AccessTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	c.logf("Successfully obtained access token (masked: %s)", maskString(tokenResp.AccessToken))
+	c.logf("Successfully got access token (expires in %d seconds)", tokenResp.ExpiresIn)
+
+	// Store the token securely
+	c.accessToken = NewSecureString(tokenResp.AccessToken)
+
+	// Return the token for immediate use
 	return tokenResp.AccessToken, nil
 }
 
@@ -527,10 +508,10 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 		if err != nil {
 			return nil, fmt.Errorf("failed to refresh token: %w", err)
 		}
-		c.accessToken = token
+		c.accessToken = NewSecureString(token)
 
 		// Retry request with new token
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
 		c.logf("[%s] Retrying request with new token", reqID)
 		return c.httpClient.Do(req)
 
@@ -579,7 +560,7 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
 
 	// Use context
 	req.WithContext(ctx)
@@ -621,7 +602,7 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 
 	secret := &SecretResponse{
 		Name:     name,
-		Value:    apiResp.Secret.StaticVersion.Value,
+		Value:    NewSecureString(apiResp.Secret.StaticVersion.Value),
 		Response: apiResp,
 	}
 
@@ -678,7 +659,7 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
 
 	// Use context
 	req.WithContext(ctx)
@@ -705,7 +686,7 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 		if secretData, ok := batchResp.Secrets[name]; ok {
 			secret := &SecretResponse{
 				Name:     name,
-				Value:    secretData.Secret.StaticVersion.Value,
+				Value:    NewSecureString(secretData.Secret.StaticVersion.Value),
 				Response: secretData,
 			}
 			fetchedSecrets = append(fetchedSecrets, secret)
@@ -851,30 +832,47 @@ func (c *Client) getCompiledTemplate(templatePath string) (*CompiledTemplate, er
 	return compiledTemplate, nil
 }
 
-// processTemplate reads template file, extracts variables, fetches secrets, and writes output
+// processTemplate processes a template file and writes the result to the output file
 func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
 	// Get compiled template
 	compiledTemplate, err := c.getCompiledTemplate(templatePath)
 	if err != nil {
-		return fmt.Errorf("failed to get compiled template: %w", err)
+		return fmt.Errorf("failed to compile template: %w", err)
 	}
 
-	// Get all secrets concurrently using getSecrets
-	secrets := c.getSecrets(ctx, compiledTemplate.Variables)
+	// Extract variables from template
+	variables := compiledTemplate.Variables
 
-	// Check for errors
-	var errs []string
+	// Get secrets for variables
+	c.logf("Fetching %d secrets for template %s", len(variables), templatePath)
+
+	var secrets []*SecretResponse
+	if len(variables) == 1 {
+		// For a single secret, use direct retrieval
+		c.logf("Fetching 1 secret directly (not using batch)")
+		secret, err := c.getSecret(ctx, variables[0])
+		if err != nil {
+			return fmt.Errorf("failed to get secret: %w", err)
+		}
+		secrets = []*SecretResponse{secret}
+	} else {
+		// For multiple secrets, use batch retrieval
+		c.logf("Fetching %d/%d secrets in batch mode (cache miss)", len(variables), len(variables))
+		var err error
+		secrets, err = c.getSecretsInBatch(ctx, variables)
+		if err != nil {
+			return fmt.Errorf("failed to get secrets: %w", err)
+		}
+	}
+
+	// Create values map
 	values := make(map[string]string)
 	for _, secret := range secrets {
 		if secret.Error != nil {
-			errs = append(errs, fmt.Sprintf("failed to get secret %q: %v", secret.Name, secret.Error))
+			c.logf("Error getting secret %q: %v", secret.Name, secret.Error)
 			continue
 		}
-		values[secret.Name] = secret.Value
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("failed to get secrets: %s", strings.Join(errs, "; "))
+		values[secret.Name] = secret.Value.Get()
 	}
 
 	// Replace variables in template
@@ -911,18 +909,33 @@ func (c *Client) SetCacheConfig(config CacheConfig) {
 	c.logf("Cache configuration updated: enabled=%v, ttl=%v", config.Enabled, config.TTL)
 }
 
-// Periodically clean up expired cache entries
-func (c *Client) startCacheCleanup(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = time.Minute
+// Cleanup securely clears sensitive data from memory
+func (c *Client) Cleanup() {
+	// Clear the cache
+	if c.cache != nil {
+		c.cache.Clear()
 	}
 
+	// Clear the access token
+	if c.accessToken != nil {
+		c.accessToken.Destroy()
+	}
+
+	// Attempt to unlock memory
+	if err := UnlockMemory(); err != nil {
+		c.logf("Warning: Failed to unlock memory: %v", err)
+	}
+}
+
+// startCacheCleanup starts a background goroutine to periodically clean up expired cache entries
+func (c *Client) startCacheCleanup(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			c.logf("Cache cleanup stopped due to context cancellation")
 			return
 		case <-ticker.C:
 			count := c.cache.ClearExpired()
@@ -934,36 +947,94 @@ func (c *Client) startCacheCleanup(ctx context.Context, interval time.Duration) 
 }
 
 func main() {
-	// Set custom usage
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <secret-name>... or\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "       %s [options] --template=<file> --output=<file> or\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "       %s --agent --config=<file>\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  -a, --agent           Run in agent mode\n")
-		fmt.Fprintf(os.Stderr, "  -c, --config=<file>   Path to agent configuration file (required with agent)\n")
-		fmt.Fprintf(os.Stderr, "  -h, --help            Show this help message\n")
-		fmt.Fprintf(os.Stderr, "  -o, --output=<file>   Path to output file (required with template)\n")
-		fmt.Fprintf(os.Stderr, "  -r, --response        Output full API response\n")
-		fmt.Fprintf(os.Stderr, "  -t, --template=<file> Path to template file\n")
-		fmt.Fprintf(os.Stderr, "  -v, --version         Show version information\n")
-		fmt.Fprintf(os.Stderr, "  -vvv, --verbose       Enable verbose logging\n")
+	// Create buffered stdout writer
+	stdoutBuf = bufio.NewWriterSize(os.Stdout, 32*1024) // 32KB buffer
+
+	// Create a custom flag set
+	flagSet := flag.NewFlagSet("vault-secret-agent", flag.ExitOnError)
+
+	// Define custom usage function
+	flagSet.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Vault Secret Agent %s - A tool for securely managing secrets from HCP Vault\n\n", version)
+		fmt.Fprintf(os.Stderr, "USAGE:\n")
+		fmt.Fprintf(os.Stderr, "  Direct secret retrieval:\n")
+		fmt.Fprintf(os.Stderr, "    vault-secret-agent [OPTIONS] SECRET_NAME [SECRET_NAME...]\n\n")
+		fmt.Fprintf(os.Stderr, "  Template processing:\n")
+		fmt.Fprintf(os.Stderr, "    vault-secret-agent -t TEMPLATE_FILE -o OUTPUT_FILE [OPTIONS]\n\n")
+		fmt.Fprintf(os.Stderr, "  Agent mode:\n")
+		fmt.Fprintf(os.Stderr, "    vault-secret-agent -a -c CONFIG_FILE [OPTIONS]\n\n")
+
+		fmt.Fprintf(os.Stderr, "OPTIONS:\n")
+		fmt.Fprintf(os.Stderr, "  General:\n")
+		fmt.Fprintf(os.Stderr, "    -v, --version       Show version information and exit\n")
+		fmt.Fprintf(os.Stderr, "    -V, --verbose       Enable verbose output\n")
+		fmt.Fprintf(os.Stderr, "    -r, --response      Output full API response as JSON\n\n")
+
+		fmt.Fprintf(os.Stderr, "  Template Mode:\n")
+		fmt.Fprintf(os.Stderr, "    -t, --template=FILE Template file to process\n")
+		fmt.Fprintf(os.Stderr, "    -o, --output=FILE   Output file for template processing\n\n")
+
+		fmt.Fprintf(os.Stderr, "  Agent Mode:\n")
+		fmt.Fprintf(os.Stderr, "    -a, --agent         Run in agent mode\n")
+		fmt.Fprintf(os.Stderr, "    -c, --config=FILE   Path to agent configuration file\n\n")
+
+		fmt.Fprintf(os.Stderr, "FEATURES:\n")
+		fmt.Fprintf(os.Stderr, "  - Direct secret retrieval from HCP Vault\n")
+		fmt.Fprintf(os.Stderr, "  - Template-based secret injection\n")
+		fmt.Fprintf(os.Stderr, "  - Background agent mode with automatic updates\n")
+		fmt.Fprintf(os.Stderr, "  - Secure memory handling with memory locking\n")
+		fmt.Fprintf(os.Stderr, "  - Caching with configurable TTL\n")
+		fmt.Fprintf(os.Stderr, "  - Batch request mode for multiple secrets\n")
+		fmt.Fprintf(os.Stderr, "  - Template pre-compilation for improved performance\n")
+		fmt.Fprintf(os.Stderr, "  - Output buffering for faster processing\n\n")
+
+		fmt.Fprintf(os.Stderr, "ENVIRONMENT VARIABLES:\n")
+		fmt.Fprintf(os.Stderr, "  HCP_CLIENT_ID         HCP client ID for authentication\n")
+		fmt.Fprintf(os.Stderr, "  HCP_CLIENT_SECRET     HCP client secret for authentication\n")
+		fmt.Fprintf(os.Stderr, "  HCP_ORGANIZATION_ID   HCP organization ID\n")
+		fmt.Fprintf(os.Stderr, "  HCP_PROJECT_ID        HCP project ID\n")
+		fmt.Fprintf(os.Stderr, "  HCP_APP_NAME          HCP application name\n\n")
+
+		fmt.Fprintf(os.Stderr, "For more information, see the README.md file.\n")
 	}
 
-	flag.Parse()
+	// Define flags
+	flagSet.BoolVar(&verbose, "V", false, "Enable verbose output")
+	flagSet.BoolVar(&verbose, "verbose", false, "Enable verbose output")
+	flagSet.BoolVar(&verbose, "vvv", false, "Enable verbose output")
+	flagSet.BoolVar(&response, "r", false, "Output full API response as JSON")
+	flagSet.BoolVar(&response, "response", false, "Output full API response as JSON")
+	flagSet.StringVar(&template, "t", "", "Template file to process")
+	flagSet.StringVar(&template, "template", "", "Template file to process")
+	flagSet.StringVar(&output, "o", "", "Output file for template processing")
+	flagSet.StringVar(&output, "output", "", "Output file for template processing")
+	flagSet.BoolVar(&agentMode, "agent", false, "Run in agent mode")
+	flagSet.BoolVar(&agentMode, "a", false, "Run in agent mode")
+	flagSet.StringVar(&agentConfig, "config", "", "Path to agent config file")
+	flagSet.StringVar(&agentConfig, "c", "", "Path to agent config file")
+	flagSet.BoolVar(&showVersion, "version", false, "Show version information")
+	flagSet.BoolVar(&showVersion, "v", false, "Show version information")
 
-	// Create buffered stdout writer
-	stdoutBuf := bufio.NewWriterSize(os.Stdout, 16*1024)
-	defer stdoutBuf.Flush()
+	// Parse flags
+	flagSet.Parse(os.Args[1:])
 
-	// Handle version flag
+	// Show version and exit if requested
 	if showVersion {
-		fmt.Fprintf(stdoutBuf, "vault-secret-agent version %s\n", version)
-		stdoutBuf.Flush()
+		fmt.Printf("vault-secret-agent version %s\n", version)
 		os.Exit(0)
 	}
 
-	// Handle agent mode
+	// Try to lock memory to prevent swapping
+	if err := LockMemory(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to lock memory: %v\n", err)
+	}
+	// Ensure memory is unlocked when the program exits
+	defer func() {
+		if err := UnlockMemory(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to unlock memory: %v\n", err)
+		}
+	}()
+
 	if agentMode {
 		if agentConfig == "" {
 			fmt.Fprintf(os.Stderr, "Error: --config=<file> is required when using --agent\n")
@@ -1002,7 +1073,7 @@ func main() {
 		}
 	} else {
 		// Not in template mode, validate secret names
-		secretNames := flag.Args()
+		secretNames := flagSet.Args()
 		if len(secretNames) == 0 {
 			fmt.Fprintf(os.Stderr, "Error: at least one secret name is required\n")
 			os.Exit(1)
@@ -1019,6 +1090,35 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error creating client: %v\n", err)
 		os.Exit(1)
 	}
+	// Ensure client resources are cleaned up
+	defer client.Cleanup()
+
+	// Get required environment variables
+	clientID := os.Getenv("HCP_CLIENT_ID")
+	clientSecret := os.Getenv("HCP_CLIENT_SECRET")
+	orgID := os.Getenv("HCP_ORGANIZATION_ID")
+	projectID := os.Getenv("HCP_PROJECT_ID")
+	appName := os.Getenv("HCP_APP_NAME")
+
+	if clientID == "" || clientSecret == "" || orgID == "" || projectID == "" || appName == "" {
+		fmt.Fprintf(os.Stderr, "Error: HCP_CLIENT_ID, HCP_CLIENT_SECRET, HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set\n")
+		os.Exit(1)
+	}
+
+	// Set client fields
+	client.orgID = orgID
+	client.projectID = projectID
+	client.appName = appName
+
+	// Get access token
+	token, err := client.getAccessToken(clientID, clientSecret)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting access token: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Store token securely in client
+	client.accessToken = NewSecureString(token)
 
 	// Handle template mode
 	if template != "" {
@@ -1030,7 +1130,7 @@ func main() {
 	}
 
 	// Process each secret
-	secretNames := flag.Args()
+	secretNames := flagSet.Args()
 	if len(secretNames) > 1 {
 		// Use getSecrets for multiple secrets
 		secrets := client.getSecrets(ctx, secretNames)
@@ -1056,7 +1156,7 @@ func main() {
 				fmt.Fprintf(stdoutBuf, "%s\n", jsonBytes)
 			} else {
 				// Write key=value to buffered stdout
-				fmt.Fprintf(stdoutBuf, "%s=%s\n", secret.Name, secret.Value)
+				fmt.Fprintf(stdoutBuf, "%s=%s\n", secret.Name, secret.Value.Get())
 			}
 		}
 		// Flush buffer at the end
@@ -1087,7 +1187,7 @@ func main() {
 		fmt.Fprintf(stdoutBuf, "%s\n", jsonBytes)
 	} else {
 		// Write key=value to buffered stdout
-		fmt.Fprintf(stdoutBuf, "%s=%s\n", secret.Name, secret.Value)
+		fmt.Fprintf(stdoutBuf, "%s=%s\n", secret.Name, secret.Value.Get())
 	}
 
 	// Flush buffer at the end

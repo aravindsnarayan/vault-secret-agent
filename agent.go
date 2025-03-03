@@ -155,7 +155,9 @@ func NewAgent(configPath string) (*Agent, error) {
 		cancel()
 		return nil, fmt.Errorf("error getting initial access token: %w", err)
 	}
-	client.accessToken = token
+
+	// Store token securely
+	client.accessToken = NewSecureString(token)
 
 	agent := &Agent{
 		config: config,
@@ -192,6 +194,11 @@ func (a *Agent) Start() error {
 func (a *Agent) Stop() {
 	a.cancel()
 	a.wg.Wait()
+
+	// Clean up sensitive data
+	if a.client != nil {
+		a.client.Cleanup()
+	}
 }
 
 // validateTemplate checks if template configuration is valid
@@ -281,7 +288,7 @@ func (a *Agent) invalidateTemplateCache(templatePath string) {
 	fmt.Printf("Invalidated template cache for %s\n", templatePath)
 }
 
-// renderTemplate renders a single template
+// renderTemplate handles the continuous rendering of a template
 func (a *Agent) renderTemplate(tmpl struct {
 	Source             string      `yaml:"source"`
 	Destination        string      `yaml:"destination"`
