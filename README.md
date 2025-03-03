@@ -2,30 +2,36 @@
 
 A powerful and flexible tool for managing secrets from HashiCorp Cloud Platform (HCP) Vault. This agent helps you securely retrieve and manage secrets in your applications.
 
+## What is this tool?
+
+In simple terms, the Vault Secret Agent is a helper tool that securely fetches sensitive information (like passwords, API keys, and other secrets) from a secure storage service called HCP Vault. It then makes this information available to your applications in a safe and efficient way.
+
+Think of it like a trusted messenger that can retrieve confidential information from a secure vault, deliver it to your applications, and ensure it's handled safely throughout the process.
+
 ## 🌟 Features
 
 - **Multiple Operating Modes**:
-  - Direct secret retrieval
-  - Template-based secret injection
-  - Background agent mode for continuous updates
+  - Direct secret retrieval - Get secrets directly when you need them
+  - Template-based secret injection - Insert secrets into configuration files
+  - Background agent mode - Automatically update secrets over time
 
 - **User-Friendly Interface**:
-  - Simple command-line interface
-  - Clear error messages
-  - Detailed help documentation
+  - Simple command-line interface - Easy to use with straightforward commands
+  - Clear error messages - Understand what went wrong quickly
+  - Detailed help documentation - Get assistance when you need it
 
 - **Secure by Design**:
-  - Automatic secret masking in logs
-  - Secure file permissions
-  - Environment variable support for credentials
-  - Memory security to protect sensitive data
+  - Automatic secret masking in logs - Prevents accidental exposure in log files
+  - Secure file permissions - Restricts who can access your secret files
+  - Environment variable support for credentials - Keeps authentication details safe
+  - Memory security to protect sensitive data - Prevents secrets from being exposed in computer memory
 
 - **Performance Optimizations**:
-  - Output buffering for faster processing
-  - Batch request mode for multiple secrets
-  - Connection pooling for efficient API usage
-  - Controlled concurrency for large secret sets
-  - Caching with TTL for improved response times
+  - Output buffering for faster processing - Makes handling large files quicker
+  - Batch request mode for multiple secrets - Retrieves multiple secrets at once for efficiency
+  - Connection pooling for efficient API usage - Reuses connections to improve speed
+  - Controlled concurrency for large secret sets - Manages multiple requests efficiently
+  - Caching with TTL for improved response times - Temporarily stores secrets to reduce wait times
 
 ## 🚀 Quick Start
 
@@ -240,4 +246,5 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🆘 Support
 
-For issues and feature requests, please create an issue in the repository. 
+For issues and feature requests, please create an issue in the repository:
+https://github.com/aravindsnarayan/vault-secret-agent.git 

@@ -995,7 +995,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  HCP_PROJECT_ID        HCP project ID\n")
 		fmt.Fprintf(os.Stderr, "  HCP_APP_NAME          HCP application name\n\n")
 
-		fmt.Fprintf(os.Stderr, "For more information, see the README.md file.\n")
+		fmt.Fprintf(os.Stderr, "For more information, see the README.md file or visit:\n")
+		fmt.Fprintf(os.Stderr, "https://github.com/aravindsnarayan/vault-secret-agent.git\n")
 	}
 
 	// Define flags

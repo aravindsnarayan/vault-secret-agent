@@ -83,7 +83,7 @@ print_success "Verbose output enabled with --verbose flag"
 
 # Test help output
 print_header "Testing help information"
-HELP_OUTPUT=$(./vault-secret-agent -h | head -n 20)
+HELP_OUTPUT=$(./vault-secret-agent -h | head -n 25)
 echo "$HELP_OUTPUT"
 print_success "Help information displayed with usage examples and grouped options"
 
