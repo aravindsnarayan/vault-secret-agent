@@ -34,3 +34,4 @@ optimisations.txt
 # Application specific files
 agent_*.log
 output.log
+.cursor/
