@@ -276,17 +276,18 @@ func (c *Cache) Size() int {
 
 // Client represents an API client for HCP Vault Secrets
 type Client struct {
-	baseURL     string
-	httpClient  *retryablehttp.Client
-	verbose     bool
-	logger      *log.Logger
-	accessToken *SecureString
-	orgID       string
-	projectID   string
-	appName     string
-	cache       *Cache
-	templates   map[string]*CompiledTemplate
-	templateMu  sync.RWMutex
+	baseURL             string
+	httpClient          *retryablehttp.Client
+	verbose             bool
+	logger              *log.Logger
+	accessToken         *SecureString
+	orgID               string
+	projectID           string
+	appName             string
+	cache               *Cache
+	templates           map[string]*CompiledTemplate
+	templateMu          sync.RWMutex
+	batchAPIUnavailable bool
 }
 
 type AccessTokenResponse struct {
@@ -616,27 +617,30 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 
 // getSecretsInBatch fetches multiple secrets in a single API call
 func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*SecretResponse, error) {
-	if len(names) == 0 {
-		return nil, nil
-	}
-
-	// Check which secrets are in the cache and which need to be fetched
+	// Check for cached secrets first
 	var cachedSecrets []*SecretResponse
 	var missingNames []string
 
 	for _, name := range names {
-		if cached, found := c.cache.Get(name); found {
-			cachedSecrets = append(cachedSecrets, cached)
-			c.logf("Cache hit for secret %q", name)
-		} else {
-			missingNames = append(missingNames, name)
+		if secret, found := c.cache.Get(name); found {
+			cachedSecrets = append(cachedSecrets, secret)
+			continue
 		}
+		missingNames = append(missingNames, name)
 	}
 
-	// If all secrets were in the cache, return them
 	if len(missingNames) == 0 {
-		c.logf("All %d secrets found in cache", len(names))
 		return cachedSecrets, nil
+	}
+
+	// If batch API is known to be unavailable, skip directly to individual requests
+	if c.batchAPIUnavailable {
+		c.logf("Batch API known to be unavailable, using individual requests")
+		individualSecrets, err := c.getSecretsIndividually(ctx, missingNames)
+		if err != nil {
+			return nil, err
+		}
+		return append(cachedSecrets, individualSecrets...), nil
 	}
 
 	// Process missing secrets in batches
@@ -686,10 +690,15 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 		// Handle non-200 responses
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			// If we get a 404, fall back to individual requests
+			// If we get a 404, fall back to individual requests for all remaining secrets
 			if resp.StatusCode == http.StatusNotFound {
-				c.logf("Batch API not available (404), falling back to individual requests")
-				return c.getSecretsIndividually(ctx, batchNames)
+				c.logf("Batch API not available (404), falling back to individual requests for all secrets")
+				c.batchAPIUnavailable = true // Remember that batch API is not available
+				individualSecrets, err := c.getSecretsIndividually(ctx, missingNames)
+				if err != nil {
+					return nil, err
+				}
+				return append(cachedSecrets, individualSecrets...), nil
 			}
 			return nil, fmt.Errorf("batch request failed with status %d: %s", resp.StatusCode, string(body))
 		}
