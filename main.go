@@ -26,9 +26,9 @@ import (
 const (
 	hcpAPIBaseURL = "https://api.cloud.hashicorp.com/secrets/2023-11-28"
 	authURL       = "https://auth.hashicorp.com/oauth/token"
-	version       = "0.1.0"         // Current version of the binary
-	defaultTTL    = 5 * time.Minute // Default TTL for cached secrets
-	batchSize     = 10              // Maximum number of secrets to fetch in a single batch
+	version       = "0.1.1"         // Current version of the binary
+	defaultTTL    = 2 * time.Minute // Default TTL for cached secrets
+	batchSize     = 50              // Maximum number of secrets to fetch in a single batch
 )
 
 // maskString masks a string by showing only the first 4 and last 4 characters
@@ -157,6 +157,7 @@ func maskURL(url string) string {
 // CachedSecret represents a secret stored in the cache
 type CachedSecret struct {
 	Secret    *SecretResponse
+	Version   int
 	ExpiresAt time.Time
 }
 
@@ -210,6 +211,23 @@ func (c *Cache) Get(name string) (*SecretResponse, bool) {
 	return cached.Secret, true
 }
 
+// GetVersion returns the cached version of a secret if it exists
+func (c *Cache) GetVersion(name string) (int, bool) {
+	if !c.enabled {
+		return 0, false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cached, ok := c.secrets[name]
+	if !ok {
+		return 0, false
+	}
+
+	return cached.Version, true
+}
+
 // Set adds a secret to the cache with the configured TTL
 func (c *Cache) Set(name string, secret *SecretResponse) {
 	if !c.enabled {
@@ -219,8 +237,17 @@ func (c *Cache) Set(name string, secret *SecretResponse) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Check if we have a newer version already cached
+	if existing, ok := c.secrets[name]; ok {
+		if existing.Version > secret.Version {
+			// Don't overwrite newer version with older one
+			return
+		}
+	}
+
 	c.secrets[name] = CachedSecret{
 		Secret:    secret,
+		Version:   secret.Version,
 		ExpiresAt: time.Now().Add(c.ttl),
 	}
 }
@@ -274,6 +301,23 @@ func (c *Cache) Size() int {
 	return len(c.secrets)
 }
 
+// AgentStats tracks the health and performance of the agent
+type AgentStats struct {
+	LastSuccessfulFetch time.Time
+	FailedAttempts      int
+	CacheSize           int
+	BatchStats          BatchStats
+	mu                  sync.RWMutex
+}
+
+// BatchStats tracks batch processing metrics
+type BatchStats struct {
+	LastBatchSize int
+	AvgFetchTime  time.Duration
+	TotalFetches  int64
+	TotalErrors   int64
+}
+
 // Client represents an API client for HCP Vault Secrets
 type Client struct {
 	baseURL             string
@@ -285,9 +329,9 @@ type Client struct {
 	projectID           string
 	appName             string
 	cache               *Cache
-	templates           map[string]*CompiledTemplate
-	templateMu          sync.RWMutex
 	batchAPIUnavailable bool
+	stats               *AgentStats
+	templateLock        sync.Map // Add template lock to prevent duplicate processing
 }
 
 type AccessTokenResponse struct {
@@ -300,6 +344,7 @@ type AccessTokenResponse struct {
 type SecretResponse struct {
 	Name     string
 	Value    *SecureString
+	Version  int
 	Response interface{}
 	Error    error
 }
@@ -348,14 +393,6 @@ type CacheConfig struct {
 	TTL     time.Duration `yaml:"ttl"`
 }
 
-// CompiledTemplate represents a pre-compiled template
-type CompiledTemplate struct {
-	Source     string
-	Variables  []string
-	Content    string
-	CompiledAt time.Time
-}
-
 var (
 	verbose     bool
 	response    bool
@@ -378,9 +415,11 @@ func newClient(verbose bool) (*Client, error) {
 		log.Printf("Warning: Failed to lock memory: %v", err)
 	}
 
-	// Create retryable HTTP client
+	// Create retryable HTTP client with exponential backoff
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = 3
+	retryClient.RetryWaitMin = 1 * time.Second
+	retryClient.RetryWaitMax = 30 * time.Second
 	retryClient.Logger = nil // Disable default logger
 
 	// Create client
@@ -389,10 +428,10 @@ func newClient(verbose bool) (*Client, error) {
 		httpClient: retryClient,
 		verbose:    verbose,
 		logger:     log.New(os.Stderr, "", log.LstdFlags),
-		templates:  make(map[string]*CompiledTemplate),
+		stats:      NewAgentStats(),
 	}
 
-	// Initialize cache with default TTL
+	// Initialize cache with new default TTL
 	client.cache = NewCache(defaultTTL, true)
 
 	return client, nil
@@ -543,19 +582,9 @@ func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error)
 }
 
 func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, error) {
-	// Check cache first if enabled
-	if cached, found := c.cache.Get(name); found {
-		c.logf("Cache hit for secret %q", name)
-		return cached, nil
-	}
-
-	c.logf("Cache miss for secret %q, fetching from HCP Vault Secrets (org: %s, project: %s, app: %s)...",
-		name, maskString(c.orgID), maskString(c.projectID), c.appName)
-
-	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
+	// First, get the current version from the API without getting the full secret
+	url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s",
 		hcpAPIBaseURL, c.orgID, c.projectID, c.appName, name)
-
-	c.logf("Making request to GET %s", maskURL(url))
 
 	req, err := retryablehttp.NewRequest("GET", url, nil)
 	if err != nil {
@@ -563,12 +592,56 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 	}
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
+	req = req.WithContext(ctx)
 
-	// Use context
-	req.WithContext(ctx)
-
-	// Use doWithRetry instead of direct client.Do
 	resp, err := c.doWithRetry(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var versionResp struct {
+		Secret struct {
+			LatestVersion int `json:"latest_version"`
+		} `json:"secret"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&versionResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	latestVersion := versionResp.Secret.LatestVersion
+
+	// Check cache and compare versions
+	if cached, found := c.cache.Get(name); found {
+		if cached.Version == latestVersion {
+			c.logf("Cache hit for secret %q (version %d)", name, cached.Version)
+			return cached, nil
+		}
+		c.logf("Cache version mismatch for secret %q (cached: %d, latest: %d)",
+			name, cached.Version, latestVersion)
+	} else {
+		c.logf("Cache miss for secret %q", name)
+	}
+
+	// Fetch the full secret with its value
+	url = fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
+		hcpAPIBaseURL, c.orgID, c.projectID, c.appName, name)
+
+	req, err = retryablehttp.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
+	req = req.WithContext(ctx)
+
+	resp, err = c.doWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -605,60 +678,68 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 	secret := &SecretResponse{
 		Name:     name,
 		Value:    NewSecureString(apiResp.Secret.StaticVersion.Value),
+		Version:  apiResp.Secret.StaticVersion.Version,
 		Response: apiResp,
 	}
 
 	// Add to cache
 	c.cache.Set(name, secret)
-	c.logf("Added secret %q to cache", name)
+	c.logf("Added secret %q to cache (version %d)", name, secret.Version)
 
 	return secret, nil
 }
 
 // getSecretsInBatch fetches multiple secrets in a single API call
 func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*SecretResponse, error) {
-	// Check for cached secrets first
-	var cachedSecrets []*SecretResponse
-	var missingNames []string
-
-	for _, name := range names {
-		if secret, found := c.cache.Get(name); found {
-			cachedSecrets = append(cachedSecrets, secret)
-			continue
-		}
-		missingNames = append(missingNames, name)
-	}
-
-	if len(missingNames) == 0 {
-		return cachedSecrets, nil
-	}
-
-	// If batch API is known to be unavailable, skip directly to individual requests
 	if c.batchAPIUnavailable {
 		c.logf("Batch API known to be unavailable, using individual requests")
-		individualSecrets, err := c.getSecretsIndividually(ctx, missingNames)
-		if err != nil {
-			return nil, err
-		}
-		return append(cachedSecrets, individualSecrets...), nil
+		return c.getSecretsIndividually(ctx, names)
 	}
 
-	// Process missing secrets in batches
+	start := time.Now()
 	var fetchedSecrets []*SecretResponse
-	for i := 0; i < len(missingNames); i += batchSize {
-		end := i + batchSize
-		if end > len(missingNames) {
-			end = len(missingNames)
+
+	// Check cache first for all secrets
+	allCached := true
+	nameToSecret := make(map[string]*SecretResponse)
+	for _, name := range names {
+		if cached, found := c.cache.Get(name); found {
+			nameToSecret[name] = cached
+		} else {
+			allCached = false
 		}
-		batchNames := missingNames[i:end]
+	}
 
-		c.logf("Fetching batch %d/%d (%d secrets)", (i/batchSize)+1, (len(missingNames)+batchSize-1)/batchSize, len(batchNames))
+	if allCached {
+		c.logf("All %d secrets found in cache", len(names))
+		// Return secrets in original order
+		for _, name := range names {
+			fetchedSecrets = append(fetchedSecrets, nameToSecret[name])
+		}
+		return fetchedSecrets, nil
+	}
 
-		// Create batch request URL
+	// Get uncached secrets
+	var uncachedNames []string
+	for _, name := range names {
+		if _, found := nameToSecret[name]; !found {
+			uncachedNames = append(uncachedNames, name)
+		}
+	}
+
+	// Process uncached secrets in batches
+	for i := 0; i < len(uncachedNames); i += batchSize {
+		end := i + batchSize
+		if end > len(uncachedNames) {
+			end = len(uncachedNames)
+		}
+		batchNames := uncachedNames[i:end]
+
+		c.logf("Fetching batch of %d uncached secrets", len(batchNames))
+
 		url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets:batchOpen",
 			hcpAPIBaseURL, c.orgID, c.projectID, c.appName)
 
-		// Create request body
 		requestBody := map[string]interface{}{
 			"names": batchNames,
 		}
@@ -668,7 +749,6 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 			return nil, fmt.Errorf("failed to marshal request body: %w", err)
 		}
 
-		// Create request
 		req, err := retryablehttp.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
@@ -676,29 +756,20 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
-
-		// Use context
 		req = req.WithContext(ctx)
 
-		// Use doWithRetry instead of direct client.Do
 		resp, err := c.doWithRetry(req)
 		if err != nil {
 			return nil, fmt.Errorf("failed to make batch request: %w", err)
 		}
-		defer resp.Body.Close()
 
-		// Handle non-200 responses
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			// If we get a 404, fall back to individual requests for all remaining secrets
+			resp.Body.Close()
 			if resp.StatusCode == http.StatusNotFound {
-				c.logf("Batch API not available (404), falling back to individual requests for all secrets")
-				c.batchAPIUnavailable = true // Remember that batch API is not available
-				individualSecrets, err := c.getSecretsIndividually(ctx, missingNames)
-				if err != nil {
-					return nil, err
-				}
-				return append(cachedSecrets, individualSecrets...), nil
+				c.logf("Batch API not available (404), falling back to individual requests")
+				c.batchAPIUnavailable = true
+				return c.getSecretsIndividually(ctx, names)
 			}
 			return nil, fmt.Errorf("batch request failed with status %d: %s", resp.StatusCode, string(body))
 		}
@@ -706,91 +777,83 @@ func (c *Client) getSecretsInBatch(ctx context.Context, names []string) ([]*Secr
 		var batchResp struct {
 			Secrets map[string]struct {
 				Secret struct {
-					Name          string    `json:"name"`
-					Type          string    `json:"type"`
-					LatestVersion int       `json:"latest_version"`
-					CreatedAt     time.Time `json:"created_at"`
-					CreatedByID   string    `json:"created_by_id"`
 					StaticVersion struct {
-						Version     int       `json:"version"`
-						Value       string    `json:"value"`
-						CreatedAt   time.Time `json:"created_at"`
-						CreatedByID string    `json:"created_by_id"`
+						Version int    `json:"version"`
+						Value   string `json:"value"`
 					} `json:"static_version"`
 				} `json:"secret"`
 			} `json:"secrets"`
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+			resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode batch response: %w", err)
 		}
+		resp.Body.Close()
 
 		// Process batch response
 		for _, name := range batchNames {
 			secretData, ok := batchResp.Secrets[name]
 			if !ok {
-				c.logf("Warning: Secret %q not found in batch response", name)
-				fetchedSecrets = append(fetchedSecrets, &SecretResponse{
+				nameToSecret[name] = &SecretResponse{
 					Name:  name,
 					Value: NewSecureString(""),
 					Error: fmt.Errorf("secret not found in batch response"),
-				})
+				}
 				continue
 			}
 
 			secret := &SecretResponse{
 				Name:     name,
 				Value:    NewSecureString(secretData.Secret.StaticVersion.Value),
+				Version:  secretData.Secret.StaticVersion.Version,
 				Response: secretData,
 			}
 
-			// Add to cache
 			c.cache.Set(name, secret)
-			fetchedSecrets = append(fetchedSecrets, secret)
-			c.logf("Added secret %q to cache (version %d)", name, secretData.Secret.StaticVersion.Version)
-		}
-
-		// Add a small delay between batches to avoid rate limiting
-		if end < len(missingNames) {
-			time.Sleep(100 * time.Millisecond)
+			nameToSecret[name] = secret
 		}
 	}
 
-	// Combine cached and fetched secrets
-	results := append(cachedSecrets, fetchedSecrets...)
-
-	// Sort results to match the original order of names
-	sortedResults := make([]*SecretResponse, len(names))
-	nameToSecret := make(map[string]*SecretResponse)
-
-	for _, secret := range results {
-		nameToSecret[secret.Name] = secret
+	// Return secrets in original order
+	for _, name := range names {
+		fetchedSecrets = append(fetchedSecrets, nameToSecret[name])
 	}
 
-	for i, name := range names {
-		sortedResults[i] = nameToSecret[name]
-	}
+	duration := time.Since(start)
+	c.logf("Batch operation completed in %v for %d secrets (%d from cache)",
+		duration, len(names), len(names)-len(uncachedNames))
+	c.stats.UpdateStats(len(names), duration, nil)
 
-	c.logf("Successfully retrieved %d secrets (%d from cache, %d from API)",
-		len(sortedResults), len(cachedSecrets), len(fetchedSecrets))
-	return sortedResults, nil
+	return fetchedSecrets, nil
 }
 
 // getSecretsIndividually is a fallback method that fetches secrets one by one
 func (c *Client) getSecretsIndividually(ctx context.Context, names []string) ([]*SecretResponse, error) {
+	start := time.Now()
 	var results []*SecretResponse
 	var wg sync.WaitGroup
 	resultChan := make(chan *SecretResponse, len(names))
-	semaphore := make(chan struct{}, 5) // Limit concurrent requests
+	semaphore := make(chan struct{}, 10) // Increased concurrent requests
 
 	for _, name := range names {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire semaphore
-			defer func() { <-semaphore }() // Release semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
-			secret, err := c.getSecret(ctx, name)
+			// Try cache first
+			if cached, found := c.cache.Get(name); found {
+				resultChan <- cached
+				return
+			}
+
+			// Direct fetch with :open endpoint
+			url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets/%s:open",
+				hcpAPIBaseURL, c.orgID, c.projectID, c.appName, name)
+
+			req, err := retryablehttp.NewRequest("GET", url, nil)
 			if err != nil {
 				resultChan <- &SecretResponse{
 					Name:  name,
@@ -799,20 +862,78 @@ func (c *Client) getSecretsIndividually(ctx context.Context, names []string) ([]
 				}
 				return
 			}
+
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken.Get()))
+			req = req.WithContext(ctx)
+
+			resp, err := c.doWithRetry(req)
+			if err != nil {
+				resultChan <- &SecretResponse{
+					Name:  name,
+					Value: NewSecureString(""),
+					Error: err,
+				}
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				resultChan <- &SecretResponse{
+					Name:  name,
+					Value: NewSecureString(""),
+					Error: fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body)),
+				}
+				return
+			}
+
+			var apiResp struct {
+				Secret struct {
+					StaticVersion struct {
+						Version int    `json:"version"`
+						Value   string `json:"value"`
+					} `json:"static_version"`
+				} `json:"secret"`
+			}
+
+			if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+				resultChan <- &SecretResponse{
+					Name:  name,
+					Value: NewSecureString(""),
+					Error: err,
+				}
+				return
+			}
+
+			secret := &SecretResponse{
+				Name:     name,
+				Value:    NewSecureString(apiResp.Secret.StaticVersion.Value),
+				Version:  apiResp.Secret.StaticVersion.Version,
+				Response: apiResp,
+			}
+
+			c.cache.Set(name, secret)
 			resultChan <- secret
 		}(name)
 	}
 
-	// Wait for all goroutines to complete
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 
-	// Collect results
+	nameToSecret := make(map[string]*SecretResponse)
 	for secret := range resultChan {
-		results = append(results, secret)
+		nameToSecret[secret.Name] = secret
 	}
+
+	for _, name := range names {
+		results = append(results, nameToSecret[name])
+	}
+
+	duration := time.Since(start)
+	c.logf("Individual operations completed in %v for %d secrets", duration, len(names))
+	c.stats.UpdateStats(len(names), duration, nil)
 
 	return results, nil
 }
@@ -864,113 +985,49 @@ func bufferOutput(path string) (*bufio.Writer, *os.File, error) {
 	return bufio.NewWriterSize(file, 32*1024), file, nil // 32KB buffer
 }
 
-// compileTemplate reads a template file, extracts variables, and returns a compiled template
-func (c *Client) compileTemplate(templatePath string) (*CompiledTemplate, error) {
-	c.logf("Compiling template: %s", templatePath)
+// processTemplate processes a template file and writes the result to the output file
+func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
+	// Check if template is already being processed
+	if _, loaded := c.templateLock.LoadOrStore(templatePath, true); loaded {
+		c.logf("Template %s is already being processed, skipping duplicate", templatePath)
+		return nil
+	}
+	defer c.templateLock.Delete(templatePath)
+
+	start := time.Now()
+	c.logf("Starting template processing: %s", templatePath)
 
 	// Read template file
 	tmplData, err := os.ReadFile(templatePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read template: %w", err)
+		return fmt.Errorf("failed to read template: %w", err)
 	}
 
-	// Find all variables in template
-	var variables []string
+	// Find all unique variables in template
+	variableMap := make(map[string]struct{})
 	re := regexp.MustCompile(`\{\{\s*([^}\s]+)\s*}}`)
 	matches := re.FindAllStringSubmatch(string(tmplData), -1)
 	for _, match := range matches {
-		variables = append(variables, match[1])
+		variableMap[match[1]] = struct{}{}
 	}
 
-	if len(variables) == 0 {
-		return nil, fmt.Errorf("no variables found in template")
+	if len(variableMap) == 0 {
+		return fmt.Errorf("no variables found in template")
 	}
 
-	c.logf("Found %d variables in template: %v", len(variables), variables)
-
-	// Create compiled template
-	compiledTemplate := &CompiledTemplate{
-		Source:     templatePath,
-		Variables:  variables,
-		Content:    string(tmplData),
-		CompiledAt: time.Now(),
+	// Convert map to slice for batch processing
+	variables := make([]string, 0, len(variableMap))
+	for v := range variableMap {
+		variables = append(variables, v)
 	}
 
-	return compiledTemplate, nil
-}
+	c.logf("Found %d unique variables in template", len(variables))
 
-// getCompiledTemplate returns a compiled template, either from cache or by compiling it
-func (c *Client) getCompiledTemplate(templatePath string) (*CompiledTemplate, error) {
-	// Check if template is already compiled and cached
-	c.templateMu.RLock()
-	compiledTemplate, exists := c.templates[templatePath]
-	c.templateMu.RUnlock()
-
-	if exists {
-		c.logf("Using cached compiled template for %s", templatePath)
-		return compiledTemplate, nil
-	}
-
-	// Compile the template
-	compiledTemplate, err := c.compileTemplate(templatePath)
+	// Get secrets using batch API directly
+	secrets, err := c.getSecretsInBatch(ctx, variables)
 	if err != nil {
-		return nil, err
-	}
-
-	// Cache the compiled template
-	c.templateMu.Lock()
-	c.templates[templatePath] = compiledTemplate
-	c.templateMu.Unlock()
-
-	c.logf("Cached compiled template for %s", templatePath)
-	return compiledTemplate, nil
-}
-
-// processTemplate processes a template file and writes the result to the output file
-func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath string) error {
-	// Get compiled template
-	compiledTemplate, err := c.getCompiledTemplate(templatePath)
-	if err != nil {
-		return fmt.Errorf("failed to compile template: %w", err)
-	}
-
-	// Extract variables from template
-	variables := compiledTemplate.Variables
-
-	// Get secrets for variables
-	c.logf("Fetching %d secrets for template %s", len(variables), templatePath)
-
-	var secrets []*SecretResponse
-	if len(variables) == 1 {
-		// For a single secret, use direct retrieval
-		c.logf("Fetching 1 secret directly (not using batch)")
-		secret, err := c.getSecret(ctx, variables[0])
-		if err != nil {
-			c.logf("Warning: Failed to get secret %q: %v", variables[0], err)
-			secrets = []*SecretResponse{{
-				Name:  variables[0],
-				Value: NewSecureString(""),
-				Error: err,
-			}}
-		} else {
-			secrets = []*SecretResponse{secret}
-		}
-	} else {
-		// For multiple secrets, use batch retrieval
-		c.logf("Fetching %d/%d secrets in batch mode (cache miss)", len(variables), len(variables))
-		secrets, err = c.getSecretsInBatch(ctx, variables)
-		if err != nil {
-			c.logf("Warning: Failed to get secrets in batch mode: %v", err)
-			// Continue with empty values for failed secrets
-			secrets = make([]*SecretResponse, len(variables))
-			for i, name := range variables {
-				secrets[i] = &SecretResponse{
-					Name:  name,
-					Value: NewSecureString(""),
-					Error: err,
-				}
-			}
-		}
+		c.logf("Warning: Failed to get secrets in batch mode: %v", err)
+		// Don't return error, continue with empty values
 	}
 
 	// Create values map
@@ -984,8 +1041,8 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 		values[secret.Name] = secret.Value.Get()
 	}
 
-	// Replace variables in template
-	result := compiledTemplate.Content
+	// Replace variables in template efficiently
+	result := string(tmplData)
 	for name, value := range values {
 		placeholder := fmt.Sprintf("{{ %s }}", name)
 		result = strings.ReplaceAll(result, placeholder, value)
@@ -1008,7 +1065,8 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 		return fmt.Errorf("failed to flush buffer: %w", err)
 	}
 
-	c.logf("Successfully processed template %s and wrote output to %s", templatePath, outputPath)
+	duration := time.Since(start)
+	c.logf("Template processing completed in %v: %s -> %s", duration, templatePath, outputPath)
 	return nil
 }
 
@@ -1053,6 +1111,36 @@ func (c *Client) startCacheCleanup(ctx context.Context, interval time.Duration) 
 			}
 		}
 	}
+}
+
+// NewAgentStats creates a new AgentStats instance
+func NewAgentStats() *AgentStats {
+	return &AgentStats{}
+}
+
+// UpdateStats updates agent statistics
+func (s *AgentStats) UpdateStats(secretsCount int, fetchDuration time.Duration, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.BatchStats.TotalFetches++
+	s.BatchStats.LastBatchSize = secretsCount
+	s.BatchStats.AvgFetchTime = (s.BatchStats.AvgFetchTime*time.Duration(s.BatchStats.TotalFetches-1) + fetchDuration) /
+		time.Duration(s.BatchStats.TotalFetches)
+
+	if err != nil {
+		s.FailedAttempts++
+		s.BatchStats.TotalErrors++
+	} else {
+		s.LastSuccessfulFetch = time.Now()
+	}
+}
+
+// GetStats returns the current agent statistics
+func (s *AgentStats) GetStats() AgentStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return *s
 }
 
 func main() {

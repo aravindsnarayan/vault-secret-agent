@@ -7,9 +7,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"syscall"
 	"time"
+
+	"crypto/sha256"
 
 	"gopkg.in/yaml.v3"
 )
@@ -238,67 +241,129 @@ func (a *Agent) processTemplate(tmpl struct {
 	ticker := time.NewTicker(a.config.Agent.RenderInterval)
 	defer ticker.Stop()
 
-	// Track the last modified time of the template file
+	// Keep track of last modified time and content hash
 	var lastModTime time.Time
+	var lastContentHash string
+	var lastSecretVersions = make(map[string]int)
+	var lastVersionCheck = make(map[string]time.Time)
+	versionCheckInterval := 30 * time.Second // Check versions every 30 seconds
 
-	// Initial check of template file modification time
-	if fileInfo, err := os.Stat(tmpl.Source); err == nil {
-		lastModTime = fileInfo.ModTime()
+	process := func() error {
+		needsUpdate := false
+
+		// Check if source file has changed
+		stat, err := os.Stat(tmpl.Source)
+		if err != nil {
+			return fmt.Errorf("failed to stat template file: %w", err)
+		}
+
+		content, err := os.ReadFile(tmpl.Source)
+		if err != nil {
+			return fmt.Errorf("failed to read template: %w", err)
+		}
+
+		currentHash := fmt.Sprintf("%x", sha256.Sum256(content))
+
+		// Always check for template changes first
+		if currentHash != lastContentHash {
+			fmt.Printf("Template %s content has changed, updating...\n", tmpl.Source)
+			needsUpdate = true
+		} else if !lastModTime.Equal(stat.ModTime()) {
+			fmt.Printf("Template %s modification time has changed, updating...\n", tmpl.Source)
+			needsUpdate = true
+		}
+
+		// Extract all secret names from template
+		re := regexp.MustCompile(`\{\{\s*([^}\s]+)\s*}}`)
+		matches := re.FindAllStringSubmatch(string(content), -1)
+		secretNames := make([]string, 0, len(matches))
+
+		for _, match := range matches {
+			secretNames = append(secretNames, match[1])
+		}
+
+		if len(secretNames) > 0 {
+			now := time.Now()
+			secretsToCheck := make([]string, 0, len(secretNames))
+
+			// Always check versions for all secrets periodically
+			for _, name := range secretNames {
+				lastCheck, exists := lastVersionCheck[name]
+				if !exists || now.Sub(lastCheck) >= versionCheckInterval {
+					secretsToCheck = append(secretsToCheck, name)
+					lastVersionCheck[name] = now
+				}
+			}
+
+			// Check versions for secrets
+			if len(secretsToCheck) > 0 {
+				secrets, err := a.client.getSecretsInBatch(a.ctx, secretsToCheck)
+				if err != nil {
+					fmt.Printf("Warning: Failed to check secret versions: %v\n", err)
+				} else {
+					// Check for version changes
+					for _, secret := range secrets {
+						if lastVersion, exists := lastSecretVersions[secret.Name]; !exists || lastVersion != secret.Version {
+							fmt.Printf("Secret %s version changed from %d to %d, fetching new value...\n",
+								secret.Name, lastVersion, secret.Version)
+
+							// Fetch this specific secret's new value
+							freshSecrets, err := a.client.getSecretsInBatch(a.ctx, []string{secret.Name})
+							if err != nil {
+								fmt.Printf("Warning: Failed to fetch updated secret %s: %v\n", secret.Name, err)
+							} else if len(freshSecrets) > 0 {
+								a.client.cache.Set(secret.Name, freshSecrets[0])
+								lastSecretVersions[secret.Name] = freshSecrets[0].Version
+								needsUpdate = true
+							}
+						} else {
+							// Update last known version
+							lastSecretVersions[secret.Name] = secret.Version
+						}
+					}
+				}
+			}
+		}
+
+		if needsUpdate {
+			// Process the template using cached values
+			fmt.Printf("Processing template %s -> %s\n", tmpl.Source, tmpl.Destination)
+			if err := a.client.processTemplate(a.ctx, tmpl.Source, tmpl.Destination); err != nil {
+				return fmt.Errorf("failed to process template: %w", err)
+			}
+
+			// Update tracking info only after successful processing
+			lastModTime = stat.ModTime()
+			lastContentHash = currentHash
+
+			fmt.Printf("Successfully updated template %s\n", tmpl.Source)
+		}
+
+		return nil
 	}
 
+	// Initial render
+	if err := process(); err != nil {
+		fmt.Printf("Error processing template %s: %v\n", tmpl.Source, err)
+	}
+
+	// Periodic renders
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			// Check if template file has been modified
-			if fileInfo, err := os.Stat(tmpl.Source); err == nil {
-				currentModTime := fileInfo.ModTime()
-				if currentModTime.After(lastModTime) {
-					// Template file has changed, invalidate cache
-					a.invalidateTemplateCache(tmpl.Source)
-					lastModTime = currentModTime
-				}
-			}
-
-			// Log template processing start
-			fmt.Printf("Processing template %s -> %s\n", tmpl.Source, tmpl.Destination)
-
-			if err := a.renderTemplate(tmpl); err != nil {
+			if err := process(); err != nil {
 				if a.config.Agent.NoExitOnRetry {
-					fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
+					fmt.Printf("Error processing template %s: %v\n", tmpl.Source, err)
 				} else {
-					fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
+					fmt.Printf("Fatal error processing template %s: %v\n", tmpl.Source, err)
 					a.Stop()
 					return
 				}
-			} else {
-				fmt.Printf("Successfully rendered template %s\n", tmpl.Source)
 			}
 		}
 	}
-}
-
-// invalidateTemplateCache removes a template from the cache to force recompilation
-func (a *Agent) invalidateTemplateCache(templatePath string) {
-	a.client.templateMu.Lock()
-	defer a.client.templateMu.Unlock()
-
-	delete(a.client.templates, templatePath)
-	fmt.Printf("Invalidated template cache for %s\n", templatePath)
-}
-
-// renderTemplate handles the continuous rendering of a template
-func (a *Agent) renderTemplate(tmpl struct {
-	Source             string      `yaml:"source"`
-	Destination        string      `yaml:"destination"`
-	ErrorOnMissingKeys bool        `yaml:"error_on_missing_keys"`
-	CreateDir          bool        `yaml:"create_dir"`
-	FilePerms          os.FileMode `yaml:"file_perms"`
-}) error {
-	// Log start of template rendering
-	fmt.Printf("Starting template rendering process for %s\n", tmpl.Source)
-	return a.client.processTemplate(a.ctx, tmpl.Source, tmpl.Destination)
 }
 
 // Run starts the agent with the provided context
