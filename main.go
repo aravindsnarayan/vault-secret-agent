@@ -167,10 +167,32 @@ func newClient(verbose bool) (*Client, error) {
 		return nil, fmt.Errorf("HCP_CLIENT_ID, HCP_CLIENT_SECRET, HCP_ORGANIZATION_ID, HCP_PROJECT_ID, and HCP_APP_NAME must be set")
 	}
 
-	// Create retryable HTTP client
+	// Create retryable HTTP client with optimized connection pooling
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = 3
 	retryClient.Logger = nil // Disable internal logging
+
+	// Configure connection pooling and timeouts
+	retryClient.HTTPClient.Transport = &http.Transport{
+		// Connection pooling settings
+		MaxIdleConns:        100,              // Total number of idle connections across all hosts
+		MaxIdleConnsPerHost: 10,               // Number of idle connections maintained per host
+		MaxConnsPerHost:     20,               // Limit connections per host to prevent overwhelming the API
+		IdleConnTimeout:     90 * time.Second, // How long to keep idle connections alive
+
+		// Performance optimizations
+		DisableCompression:    false,            // Keep compression enabled for bandwidth efficiency
+		TLSHandshakeTimeout:   10 * time.Second, // Timeout for TLS handshake
+		ExpectContinueTimeout: 1 * time.Second,  // Timeout for expect-continue handshake
+		ResponseHeaderTimeout: 10 * time.Second, // Timeout waiting for header response
+
+		// Keep-alive settings
+		ForceAttemptHTTP2: true,  // Prefer HTTP/2 if possible
+		DisableKeepAlives: false, // Keep connections alive for reuse
+	}
+
+	// Set client timeouts
+	retryClient.HTTPClient.Timeout = 30 * time.Second // Total request timeout
 
 	// Create client
 	client := &Client{
@@ -183,6 +205,11 @@ func newClient(verbose bool) (*Client, error) {
 		appName:        appName,
 		secretCache:    make(map[string]cachedSecret),
 		secretCacheTTL: 0, // Default to disabled - only enable for Agent mode
+	}
+
+	if verbose {
+		client.logf("HTTP client configured with connection pooling: MaxIdleConns=%d, MaxIdleConnsPerHost=%d, IdleConnTimeout=%s",
+			100, 10, "90s")
 	}
 
 	// Get access token
@@ -244,9 +271,33 @@ func (c *Client) getAccessToken(clientID, clientSecret string) (string, error) {
 }
 
 func (c *Client) doWithRetry(req *retryablehttp.Request) (*http.Response, error) {
+	start := time.Now()
+
 	resp, err := c.httpClient.Do(req)
+
+	requestDuration := time.Since(start)
+
 	if err != nil {
+		// Log connection errors in detail when verbose
+		if c.verbose {
+			c.logf("HTTP request error: %v (took %v)", err, requestDuration)
+		}
 		return nil, err
+	}
+
+	// Add detailed logging in verbose mode
+	if c.verbose {
+		// Check if connection was reused
+		wasReused := "no"
+		if resp.TLS != nil && resp.TLS.DidResume {
+			wasReused = "yes"
+		}
+
+		c.logf("HTTP request completed: status=%d, duration=%v, connection_reused=%s, url=%s",
+			resp.StatusCode,
+			requestDuration,
+			wasReused,
+			maskURL(req.URL.String()))
 	}
 
 	// Handle unauthorized response by refreshing token and retrying
