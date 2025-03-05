@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -88,6 +89,17 @@ type Client struct {
 	orgID       string
 	projectID   string
 	appName     string
+	// Cache-related fields
+	secretCache    map[string]cachedSecret
+	secretCacheMu  sync.RWMutex
+	secretCacheTTL time.Duration
+}
+
+// cachedSecret represents a secret stored in the cache
+type cachedSecret struct {
+	response *SecretResponse
+	expiry   time.Time
+	version  int // Version of the secret from the API
 }
 
 type AccessTokenResponse struct {
@@ -162,13 +174,15 @@ func newClient(verbose bool) (*Client, error) {
 
 	// Create client
 	client := &Client{
-		baseURL:    "https://api.cloud.hashicorp.com/secrets/2023-11-28",
-		httpClient: retryClient,
-		verbose:    verbose,
-		logger:     log.New(os.Stderr, "vault-secret-agent: ", log.LstdFlags),
-		orgID:      orgID,
-		projectID:  projectID,
-		appName:    appName,
+		baseURL:        "https://api.cloud.hashicorp.com/secrets/2023-11-28",
+		httpClient:     retryClient,
+		verbose:        verbose,
+		logger:         log.New(os.Stderr, "vault-secret-agent: ", log.LstdFlags),
+		orgID:          orgID,
+		projectID:      projectID,
+		appName:        appName,
+		secretCache:    make(map[string]cachedSecret),
+		secretCacheTTL: 0, // Default to disabled - only enable for Agent mode
 	}
 
 	// Get access token
@@ -320,11 +334,14 @@ func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretRespon
 	results := make([]*SecretResponse, len(names))
 	var wg sync.WaitGroup
 
+	// Clear expired cache entries before batch processing
+	c.clearExpiredCache()
+
 	for i, name := range names {
 		wg.Add(1)
 		go func(i int, name string) {
 			defer wg.Done()
-			secret, err := c.getSecret(ctx, name)
+			secret, err := c.getSecretWithCache(ctx, name)
 			if err != nil {
 				results[i] = &SecretResponse{
 					Name:  name,
@@ -394,6 +411,342 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 
 	c.logf("Successfully rendered template and wrote output to %s", outputPath)
 	return nil
+}
+
+// getSecretWithCache retrieves a secret, using the cache if valid
+// Cache is disabled by default for CLI and template modes, and only enabled in agent mode
+func (c *Client) getSecretWithCache(ctx context.Context, name string) (*SecretResponse, error) {
+	// If cache is disabled, directly call getSecret
+	if c.secretCacheTTL <= 0 {
+		return c.getSecret(ctx, name)
+	}
+
+	// Check cache first
+	c.secretCacheMu.RLock()
+	cached, exists := c.secretCache[name]
+	c.secretCacheMu.RUnlock()
+
+	// If cached and not expired, use cached value
+	if exists && time.Now().Before(cached.expiry) {
+		c.logf("Using cached secret %q (expires in %v)", name, time.Until(cached.expiry).Round(time.Second))
+		return cached.response, nil
+	}
+
+	// Otherwise fetch from API
+	c.logf("Cache miss for secret %q, fetching from API", name)
+	secret, err := c.getSecret(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract version from response if available
+	var version int
+	if secret.Response != nil {
+		c.logf("Extracting version information from secret %q", name)
+		if v, ok := c.extractVersionFromResponse(name, secret.Response); ok {
+			version = v
+			c.logf("Secret %q has version: %d", name, version)
+		}
+	}
+
+	// Store in cache
+	c.secretCacheMu.Lock()
+	c.secretCache[name] = cachedSecret{
+		response: secret,
+		expiry:   time.Now().Add(c.secretCacheTTL),
+		version:  version,
+	}
+	c.secretCacheMu.Unlock()
+
+	return secret, nil
+}
+
+// clearExpiredCache removes expired entries from the cache
+func (c *Client) clearExpiredCache() {
+	if c.secretCacheTTL <= 0 {
+		return // Cache disabled
+	}
+
+	now := time.Now()
+	c.secretCacheMu.Lock()
+	defer c.secretCacheMu.Unlock()
+
+	for name, cached := range c.secretCache {
+		if now.After(cached.expiry) {
+			c.logf("Removing expired cache entry for %q", name)
+			delete(c.secretCache, name)
+		}
+	}
+}
+
+// checkSecretVersions periodically checks if any cached secrets have new versions
+// Returns true if any secrets were updated, false otherwise
+func (c *Client) checkSecretVersions(ctx context.Context) bool {
+	c.secretCacheMu.RLock()
+	secretNames := make([]string, 0, len(c.secretCache))
+	for name := range c.secretCache {
+		secretNames = append(secretNames, name)
+	}
+	c.secretCacheMu.RUnlock()
+
+	if len(secretNames) == 0 {
+		c.logf("No cached secrets to check versions for")
+		return false
+	}
+
+	c.logf("Checking for version changes on %d cached secrets", len(secretNames))
+
+	// Get metadata for all secrets in a single API call
+	versions, err := c.getSecretsMetadata(ctx)
+	if err != nil {
+		c.logf("Error fetching secret metadata: %v", err)
+		return false
+	}
+
+	// Check for version changes
+	c.secretCacheMu.RLock()
+	secretsToUpdate := make(map[string]int)
+	for name, cachedSecret := range c.secretCache {
+		// Skip secrets that aren't in the response (could be deleted)
+		newVersion, exists := versions[name]
+		if !exists {
+			c.logf("Secret %q not found in metadata response, skipping", name)
+			continue
+		}
+
+		// Compare versions
+		oldVersion := cachedSecret.version
+		c.logf("Secret %q: current version=%d, cached version=%d", name, newVersion, oldVersion)
+
+		if newVersion != oldVersion {
+			c.logf("Secret %q has a new version (%d -> %d), marking for update", name, oldVersion, newVersion)
+			secretsToUpdate[name] = newVersion
+		}
+	}
+	c.secretCacheMu.RUnlock()
+
+	// Update any secrets with new versions
+	if len(secretsToUpdate) > 0 {
+		c.logf("Updating %d secrets with new versions", len(secretsToUpdate))
+		for name, newVersion := range secretsToUpdate {
+			// Fetch the updated secret
+			secret, err := c.getSecret(ctx, name)
+			if err != nil {
+				c.logf("Error fetching updated secret %q: %v", name, err)
+				continue
+			}
+
+			// Update the cache
+			c.secretCacheMu.Lock()
+			c.secretCache[name] = cachedSecret{
+				response: secret,
+				expiry:   time.Now().Add(c.secretCacheTTL), // Reset TTL
+				version:  newVersion,
+			}
+			c.secretCacheMu.Unlock()
+			c.logf("Updated cache for secret %q to version %d", name, newVersion)
+		}
+		return true // Indicate that secrets were updated
+	} else {
+		c.logf("No secrets need version updates")
+		return false
+	}
+}
+
+// extractVersionFromResponse extracts version information from a secret response
+func (c *Client) extractVersionFromResponse(name string, response interface{}) (int, bool) {
+	if response == nil {
+		c.logf("Warning: Secret %q has nil response", name)
+		return 0, false
+	}
+
+	// Debug log the response structure
+	if c.verbose {
+		jsonData, _ := json.MarshalIndent(response, "", "  ")
+		c.logf("Response structure for %q: %s", name, string(jsonData))
+	}
+
+	// Use reflection to examine the concrete type
+	responseVal := reflect.ValueOf(response)
+	responseType := responseVal.Type()
+
+	// Special handling for the specific struct type from the API
+	if responseType.String() == "struct { Secret struct { Name string \"json:\\\"name\\\"\"; Type string \"json:\\\"type\\\"\"; LatestVersion int \"json:\\\"latest_version\\\"\"; CreatedAt time.Time \"json:\\\"created_at\\\"\"; CreatedByID string \"json:\\\"created_by_id\\\"\"; SyncStatus struct {} \"json:\\\"sync_status\\\"\"; StaticVersion struct { Version int \"json:\\\"version\\\"\"; Value string \"json:\\\"value\\\"\"; CreatedAt time.Time \"json:\\\"created_at\\\"\"; CreatedByID string \"json:\\\"created_by_id\\\"\" } \"json:\\\"static_version\\\"\" } \"json:\\\"secret\\\"\" }" {
+		// Access fields via reflection
+		secretField := responseVal.FieldByName("Secret")
+		if secretField.IsValid() {
+			staticVersionField := secretField.FieldByName("StaticVersion")
+			if staticVersionField.IsValid() {
+				versionField := staticVersionField.FieldByName("Version")
+				if versionField.IsValid() {
+					version := int(versionField.Int())
+					c.logf("Successfully extracted version %d from %q (via reflection)", version, name)
+					return version, true
+				}
+			}
+
+			// Also try LatestVersion field
+			latestVersionField := secretField.FieldByName("LatestVersion")
+			if latestVersionField.IsValid() {
+				version := int(latestVersionField.Int())
+				c.logf("Successfully extracted version %d from %q (via reflection, latest_version)", version, name)
+				return version, true
+			}
+		}
+	}
+
+	// Try to extract from map (original method)
+	respMap, ok := response.(map[string]interface{})
+	if !ok {
+		c.logf("Warning: Secret %q response is not a recognized format, type: %T", name, response)
+		return 0, false
+	}
+
+	// The API might return the secret directly or nested under a "secret" key
+	var secretObj map[string]interface{}
+	if secretField, hasSecretField := respMap["secret"]; hasSecretField {
+		secretObj, ok = secretField.(map[string]interface{})
+		if !ok {
+			c.logf("Warning: Secret %q 'secret' field is not a map, type: %T", name, respMap["secret"])
+			return 0, false
+		}
+	} else {
+		// Assume the response itself is the secret object
+		secretObj = respMap
+	}
+
+	// Look for version information in multiple possible locations
+	// 1. Try static_version.version path
+	if staticVersion, ok := secretObj["static_version"].(map[string]interface{}); ok {
+		if versionVal, ok := staticVersion["version"].(float64); ok {
+			c.logf("Successfully extracted version %d from %q (map path: static_version.version)", int(versionVal), name)
+			return int(versionVal), true
+		}
+	}
+
+	// 2. Try latest_version field
+	if latestVersion, ok := secretObj["latest_version"].(float64); ok {
+		c.logf("Successfully extracted version %d from %q (map path: latest_version)", int(latestVersion), name)
+		return int(latestVersion), true
+	}
+
+	// 3. Try direct version field
+	if versionVal, ok := secretObj["version"].(float64); ok {
+		c.logf("Successfully extracted version %d from %q (map path: version)", int(versionVal), name)
+		return int(versionVal), true
+	}
+
+	c.logf("Warning: Couldn't find version information in response for %q", name)
+	return 0, false
+}
+
+// getSecretsMetadata retrieves metadata for all secrets without fetching their values
+// This is a more efficient way to check for version changes
+func (c *Client) getSecretsMetadata(ctx context.Context) (map[string]int, error) {
+	versions := make(map[string]int)
+	pageToken := ""
+	pageSize := 100 // Fetch up to 100 secrets per request
+
+	// Check if context is already canceled
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		// Continue if context is not canceled
+	}
+
+	for {
+		// Construct the URL with pagination parameters
+		url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets?pagination.page_size=%d",
+			c.baseURL, c.orgID, c.projectID, c.appName, pageSize)
+
+		if pageToken != "" {
+			url += fmt.Sprintf("&pagination.next_page_token=%s", pageToken)
+		}
+
+		// Create the request
+		req, err := retryablehttp.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		// Associate the request with the context
+		req = req.WithContext(ctx)
+
+		// Set headers
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+		req.Header.Set("Content-Type", "application/json")
+
+		// Make the request
+		c.logf("Fetching metadata for secrets from HCP Vault Secrets (org: %s, project: %s, app: %s, page: %s)...",
+			maskString(c.orgID), maskString(c.projectID), c.appName, pageToken)
+
+		// Use doWithRetry instead of direct client.Do
+		resp, err := c.doWithRetry(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Parse the response
+		var apiResp struct {
+			Secrets []struct {
+				Name          string `json:"name"`
+				Type          string `json:"type"`
+				LatestVersion int    `json:"latest_version"`
+				CreatedAt     string `json:"created_at"`
+				StaticVersion struct {
+					Version int `json:"version"`
+				} `json:"static_version"`
+			} `json:"secrets"`
+			Pagination struct {
+				NextPageToken string `json:"next_page_token"`
+			} `json:"pagination"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+		resp.Body.Close()
+
+		// Process this page of results
+		for _, secret := range apiResp.Secrets {
+			// Use static_version.version if available, otherwise use latest_version
+			version := secret.LatestVersion
+			if secret.StaticVersion.Version > 0 {
+				version = secret.StaticVersion.Version
+			}
+			versions[secret.Name] = version
+			c.logf("Secret %q metadata: latest_version=%d", secret.Name, version)
+		}
+
+		c.logf("Retrieved metadata for %d secrets on this page", len(apiResp.Secrets))
+
+		// Check if context is canceled before proceeding to next page
+		select {
+		case <-ctx.Done():
+			return versions, ctx.Err()
+		default:
+			// Continue if context is not canceled
+		}
+
+		// Check if there are more pages
+		if apiResp.Pagination.NextPageToken == "" {
+			break // No more pages
+		}
+
+		// Set token for next page
+		pageToken = apiResp.Pagination.NextPageToken
+	}
+
+	c.logf("Successfully retrieved metadata for %d secrets in total", len(versions))
+	return versions, nil
 }
 
 func main() {
@@ -495,7 +848,7 @@ func main() {
 	// Process each secret
 	secretNames := flag.Args()
 	for _, name := range secretNames {
-		secret, err := client.getSecret(ctx, name)
+		secret, err := client.getSecretWithCache(ctx, name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting secret: %v\n", err)
 			os.Exit(1)

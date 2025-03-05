@@ -33,9 +33,9 @@ type HCPConfig struct {
 
 // AgentSettings contains agent behavior configuration
 type AgentSettings struct {
-	RenderInterval     time.Duration `yaml:"render_interval"`
-	ExitOnRetryFailure bool          `yaml:"exit_on_retry_failure"`
-	Retry              RetryConfig   `yaml:"retry"`
+	ExitOnRetryFailure bool        `yaml:"exit_on_retry_failure"`
+	Retry              RetryConfig `yaml:"retry"`
+	Cache              CacheConfig `yaml:"cache"`
 }
 
 // RetryConfig contains retry settings
@@ -62,13 +62,22 @@ type TemplateConfig struct {
 	Permissions       string `yaml:"permissions"`
 }
 
+// CacheConfig contains cache settings
+type CacheConfig struct {
+	Enabled              bool          `yaml:"enabled"`
+	TTL                  time.Duration `yaml:"ttl"`
+	VersionCheck         bool          `yaml:"version_check"`          // Whether to check for version changes
+	VersionCheckInterval time.Duration `yaml:"version_check_interval"` // How often to check for version changes
+}
+
 // Agent represents the vault-secret-agent process
 type Agent struct {
-	config AgentConfig
-	client *Client
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	config           AgentConfig
+	client           *Client
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	versionCheckStop chan struct{} // Channel to stop version checking
 }
 
 // expandEnvVars replaces ${VAR} or $VAR in the string according to the values
@@ -151,6 +160,20 @@ func NewAgent(configPath string) (*Agent, error) {
 	client.projectID = config.Agent.HCP.ProjectID
 	client.appName = config.Agent.HCP.AppName
 
+	// Configure cache from settings
+	if config.Agent.Settings.Cache.Enabled {
+		client.secretCacheTTL = config.Agent.Settings.Cache.TTL
+		client.logf("Secret caching enabled with TTL: %s", client.secretCacheTTL)
+
+		if config.Agent.Settings.Cache.VersionCheck {
+			client.logf("Secret version checking enabled with interval: %s",
+				config.Agent.Settings.Cache.VersionCheckInterval)
+		}
+	} else {
+		client.secretCacheTTL = 0 // Disable cache
+		client.logf("Secret caching disabled")
+	}
+
 	// Get initial access token
 	token, err := client.getAccessToken(config.Agent.HCP.ClientID, config.Agent.HCP.ClientSecret)
 	if err != nil {
@@ -160,10 +183,11 @@ func NewAgent(configPath string) (*Agent, error) {
 	client.accessToken = token
 
 	return &Agent{
-		config: config,
-		client: client,
-		ctx:    ctx,
-		cancel: cancel,
+		config:           config,
+		client:           client,
+		ctx:              ctx,
+		cancel:           cancel,
+		versionCheckStop: nil, // Will be initialized in Start if needed
 	}, nil
 }
 
@@ -182,11 +206,25 @@ func (a *Agent) Start() error {
 		go a.processTemplate(tmpl)
 	}
 
+	// Start version checker if enabled
+	if a.config.Agent.Settings.Cache.Enabled &&
+		a.config.Agent.Settings.Cache.VersionCheck &&
+		a.config.Agent.Settings.Cache.VersionCheckInterval > 0 {
+		a.versionCheckStop = make(chan struct{})
+		a.wg.Add(1)
+		go a.runVersionChecker()
+	}
+
 	return nil
 }
 
 // Stop gracefully shuts down the agent
 func (a *Agent) Stop() {
+	// Stop version checker if running
+	if a.versionCheckStop != nil {
+		close(a.versionCheckStop)
+	}
+
 	a.cancel()
 	a.wg.Wait()
 }
@@ -209,31 +247,76 @@ func (a *Agent) validateTemplate(tmpl TemplateConfig) error {
 	return nil
 }
 
-// processTemplate handles the continuous rendering of a template
+// renderAllTemplates renders all templates
+func (a *Agent) renderAllTemplates() {
+	for _, tmpl := range a.config.Agent.Templates {
+		if err := a.renderTemplate(tmpl); err != nil {
+			if a.config.Agent.Settings.ExitOnRetryFailure {
+				fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
+				a.Stop()
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
+		}
+	}
+}
+
+// processTemplate handles the template rendering
+// It renders the template once on startup
 func (a *Agent) processTemplate(tmpl TemplateConfig) {
 	defer a.wg.Done()
 
-	ticker := time.NewTicker(a.config.Agent.Settings.RenderInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
+	// Render once immediately
+	if err := a.renderTemplate(tmpl); err != nil {
+		if a.config.Agent.Settings.ExitOnRetryFailure {
+			fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
+			a.Stop()
 			return
-		case <-ticker.C:
-			if err := a.renderTemplate(tmpl); err != nil {
-				if a.config.Agent.Settings.ExitOnRetryFailure {
-					fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
-					a.Stop()
-					return
-				}
-				fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
-			}
 		}
+		fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
 	}
+
+	// No periodic rendering - templates are only rendered on startup and when secrets change
 }
 
 // renderTemplate renders a single template
 func (a *Agent) renderTemplate(tmpl TemplateConfig) error {
 	return a.client.processTemplate(a.ctx, tmpl.Source, tmpl.Destination)
+}
+
+// runVersionChecker periodically checks for version changes
+func (a *Agent) runVersionChecker() {
+	defer a.wg.Done()
+
+	interval := a.config.Agent.Settings.Cache.VersionCheckInterval
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	fmt.Fprintf(os.Stdout, "Starting secret version checker (interval: %s)\n", interval)
+	a.client.logf("Version checker started with interval: %s", interval)
+
+	// Immediately run first check - ignore result since initial render is handled by processTemplate
+	a.client.checkSecretVersions(a.ctx)
+
+	// Initial render is handled by processTemplate, no need to render here
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			a.client.logf("Version checker stopping due to context done")
+			return
+		case <-a.versionCheckStop:
+			a.client.logf("Version checker stopping due to stop signal")
+			return
+		case <-ticker.C:
+			a.client.logf("Running scheduled version check")
+			secretsChanged := a.client.checkSecretVersions(a.ctx)
+
+			// Render templates only if secrets have changed
+			if secretsChanged {
+				a.client.logf("Secrets were updated, rendering templates")
+				a.renderAllTemplates()
+			}
+		}
+	}
 }

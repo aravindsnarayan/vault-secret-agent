@@ -9,13 +9,17 @@ agent:
 
   # Agent behavior settings
   settings:
-    render_interval: 5s     # How often to check and render templates
     exit_on_retry_failure: false  # Whether to exit if max retries reached
     retry:
       max_attempts: 3        # Maximum retry attempts
       backoff_initial: 1s    # Initial backoff duration
       backoff_max: 30s       # Maximum backoff duration
       jitter: true          # Add randomness to backoff
+    cache:
+      enabled: true         # Enable secret caching
+      ttl: 86400s           # Cache TTL (24 hours as fallback)
+      version_check: true   # Enable version checking
+      version_check_interval: 10s  # Check versions more frequently (every 10 seconds)
 
   # Logging configuration
   logging:

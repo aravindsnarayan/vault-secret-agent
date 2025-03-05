@@ -86,13 +86,17 @@ Run as a background service that automatically updates secrets:
        app_name: ${HCP_APP_NAME}
 
      settings:
-       render_interval: 5s
        exit_on_retry_failure: false
        retry:
          max_attempts: 3
          backoff_initial: 1s
          backoff_max: 30s
          jitter: true
+       cache:
+         enabled: true         # Enable secret caching
+         ttl: 86400s           # Cache TTL (24 hours)
+         version_check: true   # Enable version checking
+         version_check_interval: 10s  # Check versions every 10 seconds
 
      logging:
        level: info
@@ -132,9 +136,13 @@ Run as a background service that automatically updates secrets:
   - Organization and project details
 
 - **Behavior Settings**:
-  - `render_interval`: How often to check for updates
   - `exit_on_retry_failure`: Whether to exit on repeated failures
   - Retry settings for resilience
+  - Cache settings for improved performance:
+    - `cache.enabled`: Enable secret caching
+    - `cache.ttl`: Cache lifetime for secrets
+    - `cache.version_check`: Enable version checking to detect secret changes
+    - `cache.version_check_interval`: How often to check for secret version changes
 
 - **Logging**:
   - Log level (debug, info, warn, error)
@@ -145,6 +153,27 @@ Run as a background service that automatically updates secrets:
   - Source and destination paths
   - Error handling options
   - File permissions
+
+## 🚀 Performance Optimizations
+
+### Intelligent Template Rendering
+
+The agent uses an intelligent approach to template rendering:
+
+1. **On-Demand Rendering**: Templates are only rendered:
+   - When the agent starts
+   - When a secret's value changes
+
+2. **Efficient Version Checking**:
+   - Retrieves metadata for all secrets in a single API call (with pagination)
+   - Only fetches full secret values when a version change is detected
+   - Dramatically reduces API calls and resource usage
+
+3. **Configurable Settings**:
+   - Templates are rendered only on startup and when secrets change (no periodic rendering)
+   - Adjust `version_check_interval` to control how frequently to check for secret changes
+
+This approach ensures that your applications always have the latest secrets while minimizing resource usage and API calls.
 
 ## 🔒 Security Best Practices
 
