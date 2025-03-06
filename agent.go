@@ -35,7 +35,7 @@ type HCPConfig struct {
 type AgentSettings struct {
 	ExitOnRetryFailure bool        `yaml:"exit_on_retry_failure"`
 	Retry              RetryConfig `yaml:"retry"`
-	Cache              CacheConfig `yaml:"cache"`
+	Cache              Cache       `yaml:"cache"`
 }
 
 // RetryConfig contains retry settings
@@ -62,12 +62,21 @@ type TemplateConfig struct {
 	Permissions       string `yaml:"permissions"`
 }
 
-// CacheConfig contains cache settings
-type CacheConfig struct {
+// Cache represents cache configuration for the agent
+type Cache struct {
 	Enabled              bool          `yaml:"enabled"`
 	TTL                  time.Duration `yaml:"ttl"`
-	VersionCheck         bool          `yaml:"version_check"`          // Whether to check for version changes
-	VersionCheckInterval time.Duration `yaml:"version_check_interval"` // How often to check for version changes
+	VersionCheck         bool          `yaml:"version_check"`
+	VersionCheckInterval time.Duration `yaml:"version_check_interval"`
+	BatchAPI             bool          `yaml:"batch_api"`
+}
+
+// Settings contains agent settings
+type Settings struct {
+	ReloadInterval time.Duration `yaml:"reload_interval"`
+	IsConsoleUser  bool          `yaml:"is_console_user"`
+	WorkerCount    int           `yaml:"worker_count"`
+	Cache          Cache         `yaml:"cache"`
 }
 
 // Agent represents the vault-secret-agent process
@@ -168,6 +177,14 @@ func NewAgent(configPath string) (*Agent, error) {
 		if config.Agent.Settings.Cache.VersionCheck {
 			client.logf("Secret version checking enabled with interval: %s",
 				config.Agent.Settings.Cache.VersionCheckInterval)
+		}
+
+		// Configure batch API usage
+		client.useBatchAPI = config.Agent.Settings.Cache.BatchAPI
+		if client.useBatchAPI {
+			client.logf("Batch API enabled for retrieving multiple secrets")
+		} else {
+			client.logf("Batch API disabled, using individual requests")
 		}
 	} else {
 		client.secretCacheTTL = 0 // Disable cache

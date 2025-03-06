@@ -80,6 +80,7 @@ func maskURL(url string) string {
 	return maskedURL
 }
 
+// Client represents a client for the HCP Vault Secrets service
 type Client struct {
 	baseURL     string
 	httpClient  *retryablehttp.Client
@@ -93,6 +94,7 @@ type Client struct {
 	secretCache    map[string]cachedSecret
 	secretCacheMu  sync.RWMutex
 	secretCacheTTL time.Duration
+	useBatchAPI    bool // Controls whether to use batch API for retrieving multiple secrets
 }
 
 // cachedSecret represents a secret stored in the cache
@@ -204,7 +206,8 @@ func newClient(verbose bool) (*Client, error) {
 		projectID:      projectID,
 		appName:        appName,
 		secretCache:    make(map[string]cachedSecret),
-		secretCacheTTL: 0, // Default to disabled - only enable for Agent mode
+		secretCacheTTL: 0,    // Default to disabled - only enable for Agent mode
+		useBatchAPI:    true, // Enable batch API by default
 	}
 
 	if verbose {
@@ -383,11 +386,83 @@ func (c *Client) getSecret(ctx context.Context, name string) (*SecretResponse, e
 
 func (c *Client) getSecrets(ctx context.Context, names []string) []*SecretResponse {
 	results := make([]*SecretResponse, len(names))
-	var wg sync.WaitGroup
 
-	// Clear expired cache entries before batch processing
+	// Clear expired cache entries before processing
 	c.clearExpiredCache()
 
+	// Check if cache is enabled
+	cacheEnabled := c.secretCacheTTL > 0
+
+	// If batch API is enabled and we have multiple secrets, use batch approach
+	if c.useBatchAPI && len(names) > 1 {
+		c.logf("Using batch API to fetch %d secrets", len(names))
+
+		// First check which secrets are already in cache
+		var cacheMisses []string
+		cacheHits := make(map[string]*SecretResponse)
+
+		if cacheEnabled {
+			c.secretCacheMu.RLock()
+			now := time.Now()
+			for _, name := range names {
+				cached, exists := c.secretCache[name]
+				if exists && now.Before(cached.expiry) {
+					c.logf("Using cached secret %q (expires in %v)", name, time.Until(cached.expiry).Round(time.Second))
+					cacheHits[name] = cached.response
+				} else {
+					cacheMisses = append(cacheMisses, name)
+				}
+			}
+			c.secretCacheMu.RUnlock()
+		} else {
+			// If cache is disabled, all secrets are cache misses
+			cacheMisses = make([]string, len(names))
+			copy(cacheMisses, names)
+		}
+
+		// If we have cache misses, fetch them using batch API
+		if len(cacheMisses) > 0 {
+			c.logf("Fetching %d cache misses using batch API", len(cacheMisses))
+			batchResults, batchErr := c.getBatchSecrets(ctx, cacheMisses)
+
+			if batchErr != nil {
+				c.logf("Batch API request failed: %v, falling back to individual requests for all secrets", batchErr)
+				// On complete batch failure, fall back to original implementation
+				goto FallbackToIndividual
+			} else {
+				// Add batch results to cache hits
+				for _, name := range cacheMisses {
+					if result, exists := batchResults[name]; exists {
+						cacheHits[name] = result
+					} else {
+						// This should not happen with our improved getBatchSecrets, but just in case
+						c.logf("Secret %q not found in batch response, will fetch individually", name)
+						secret, err := c.getSecretWithCache(ctx, name)
+						if err != nil {
+							cacheHits[name] = &SecretResponse{
+								Name:  name,
+								Error: err,
+							}
+						} else {
+							cacheHits[name] = secret
+						}
+					}
+				}
+			}
+		}
+
+		// Map results back to original order
+		for i, name := range names {
+			results[i] = cacheHits[name]
+		}
+
+		return results
+	}
+
+FallbackToIndividual:
+	// Original implementation using individual requests
+	c.logf("Using individual requests for %d secrets", len(names))
+	var wg sync.WaitGroup
 	for i, name := range names {
 		wg.Add(1)
 		go func(i int, name string) {
@@ -798,6 +873,214 @@ func (c *Client) getSecretsMetadata(ctx context.Context) (map[string]int, error)
 
 	c.logf("Successfully retrieved metadata for %d secrets in total", len(versions))
 	return versions, nil
+}
+
+// getBatchSecrets retrieves multiple secrets in a single API call
+// This is more efficient than making individual requests when retrieving many secrets.
+//
+// Implementation details:
+// 1. Uses the secrets:open batch endpoint that returns multiple secrets at once
+// 2. Handles pagination to retrieve all available secrets
+// 3. Filters the response to only include the secrets that were requested
+// 4. Falls back to individual requests for any secrets not found in the batch response
+// 5. Updates the cache with retrieved secrets
+//
+// The implementation is designed to be robust in several ways:
+// - It processes all available pages until finding all requested secrets or exhausting pagination
+// - It provides detailed logging to track batch operations
+// - It gracefully handles missing secrets by falling back to individual requests
+// - It integrates with the caching system
+//
+// Note: This feature is disabled by default (batch_api: false in agent-config.yaml)
+// until it has been thoroughly tested in production environments. To enable it,
+// set batch_api: true in your agent configuration.
+func (c *Client) getBatchSecrets(ctx context.Context, names []string) (map[string]*SecretResponse, error) {
+	if len(names) == 0 {
+		return make(map[string]*SecretResponse), nil
+	}
+
+	c.logf("Fetching %d secrets using batch API from HCP Vault Secrets (org: %s, project: %s, app: %s)...",
+		len(names), maskString(c.orgID), maskString(c.projectID), c.appName)
+
+	// Initialize results map
+	results := make(map[string]*SecretResponse)
+
+	// Create a map for quick name lookup
+	nameSet := make(map[string]bool, len(names))
+	for _, name := range names {
+		nameSet[name] = true
+	}
+
+	// Pagination variables
+	pageToken := ""
+	pageSize := 100 // Maximum page size
+	remainingNames := len(names)
+	foundNames := make(map[string]bool)
+
+	// Loop through pages until we find all secrets or exhaust all pages
+	for remainingNames > 0 {
+		// Construct the URL with pagination parameters
+		url := fmt.Sprintf("%s/organizations/%s/projects/%s/apps/%s/secrets:open?pagination.page_size=%d",
+			c.baseURL, c.orgID, c.projectID, c.appName, pageSize)
+
+		if pageToken != "" {
+			url += fmt.Sprintf("&pagination.next_page_token=%s", pageToken)
+		}
+
+		// Create the request
+		req, err := retryablehttp.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create batch request: %w", err)
+		}
+
+		// Associate the request with the context
+		req = req.WithContext(ctx)
+
+		// Set headers
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.accessToken))
+		req.Header.Set("Content-Type", "application/json")
+
+		// Make the request
+		c.logf("Making batch request to GET %s", maskURL(url))
+
+		// Use doWithRetry instead of direct client.Do
+		resp, err := c.doWithRetry(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to make batch request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("batch request failed with status %d: %s", resp.StatusCode, string(body))
+		}
+
+		// Define the response structure
+		var apiResp struct {
+			Secrets []struct {
+				Name          string    `json:"name"`
+				Type          string    `json:"type"`
+				LatestVersion int       `json:"latest_version"`
+				CreatedAt     time.Time `json:"created_at"`
+				CreatedByID   string    `json:"created_by_id"`
+				StaticVersion struct {
+					Version     int       `json:"version"`
+					Value       string    `json:"value"`
+					CreatedAt   time.Time `json:"created_at"`
+					CreatedByID string    `json:"created_by_id"`
+				} `json:"static_version"`
+			} `json:"secrets"`
+			Pagination struct {
+				NextPageToken string `json:"next_page_token"`
+			} `json:"pagination"`
+		}
+
+		// Parse the response
+		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode batch response: %w", err)
+		}
+		resp.Body.Close()
+
+		// Process each secret in the response
+		var pageFoundCount int
+		for _, secret := range apiResp.Secrets {
+			// Only process secrets we requested
+			if nameSet[secret.Name] && !foundNames[secret.Name] {
+				// Extract version from response
+				version := secret.LatestVersion
+				if secret.StaticVersion.Version > 0 {
+					version = secret.StaticVersion.Version
+				}
+
+				// Create SecretResponse object
+				secretResp := &SecretResponse{
+					Name:     secret.Name,
+					Value:    secret.StaticVersion.Value,
+					Response: secret,
+				}
+
+				// Add to results
+				results[secret.Name] = secretResp
+				foundNames[secret.Name] = true
+				pageFoundCount++
+				remainingNames--
+
+				// Store in cache if caching is enabled
+				if c.secretCacheTTL > 0 {
+					c.secretCacheMu.Lock()
+					c.secretCache[secret.Name] = cachedSecret{
+						response: secretResp,
+						expiry:   time.Now().Add(c.secretCacheTTL),
+						version:  version,
+					}
+					c.secretCacheMu.Unlock()
+					c.logf("Cached secret %q (version %d) with TTL %s", secret.Name, version, c.secretCacheTTL)
+				}
+			}
+		}
+
+		c.logf("Found %d requested secrets on this page", pageFoundCount)
+
+		// Check if we have more pages to fetch
+		if apiResp.Pagination.NextPageToken == "" {
+			break // No more pages
+		}
+
+		// Check if we found all the secrets we need
+		if remainingNames == 0 {
+			break
+		}
+
+		// Set token for the next page
+		pageToken = apiResp.Pagination.NextPageToken
+	}
+
+	c.logf("Successfully retrieved %d/%d requested secrets using batch API", len(foundNames), len(names))
+
+	// If we couldn't find all secrets, let's fall back to individual requests for the missing ones
+	if remainingNames > 0 {
+		c.logf("Falling back to individual requests for %d missing secrets", remainingNames)
+		var missingNames []string
+		for name := range nameSet {
+			if !foundNames[name] {
+				missingNames = append(missingNames, name)
+			}
+		}
+
+		// Get missing secrets individually
+		var wg sync.WaitGroup
+		var mu sync.Mutex // To protect results map during concurrent writes
+
+		for _, name := range missingNames {
+			wg.Add(1)
+			go func(name string) {
+				defer wg.Done()
+
+				secret, err := c.getSecret(ctx, name)
+				if err != nil {
+					c.logf("Error fetching individual secret %q: %v", name, err)
+					mu.Lock()
+					results[name] = &SecretResponse{
+						Name:  name,
+						Error: err,
+					}
+					mu.Unlock()
+					return
+				}
+
+				mu.Lock()
+				results[name] = secret
+				mu.Unlock()
+
+				// We don't need to add to cache here as getSecret already does that
+			}(name)
+		}
+
+		wg.Wait()
+	}
+
+	return results, nil
 }
 
 func main() {

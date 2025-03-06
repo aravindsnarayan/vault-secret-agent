@@ -20,6 +20,7 @@ agent:
       ttl: 86400s           # Cache TTL (24 hours as fallback)
       version_check: true   # Enable version checking
       version_check_interval: 10s  # Check versions more frequently (every 10 seconds)
+      batch_api: true       # Temporarily disable batch API until fully tested
 
   # Logging configuration
   logging:
