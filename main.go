@@ -508,26 +508,31 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 	// Get all secrets concurrently using getSecrets
 	secrets := c.getSecrets(ctx, variables)
 
-	// Check for errors
-	var errs []string
+	// Check for errors - but don't fail completely
 	values := make(map[string]string)
+	var missingSecrets []string
+
 	for _, secret := range secrets {
 		if secret.Error != nil {
-			errs = append(errs, fmt.Sprintf("failed to get secret %q: %v", secret.Name, secret.Error))
-			continue
+			c.logf("Warning: failed to get secret %q: %v", secret.Name, secret.Error)
+			missingSecrets = append(missingSecrets, secret.Name)
+			// Don't add to values - the placeholder will remain in the template
+		} else {
+			values[secret.Name] = secret.Value
 		}
-		values[secret.Name] = secret.Value
 	}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("failed to get secrets: %s", strings.Join(errs, "; "))
-	}
-
-	// Replace variables in template
+	// Replace variables in template with available values
 	result := string(tmplData)
 	for name, value := range values {
 		placeholder := fmt.Sprintf("{{ %s }}", name)
 		result = strings.ReplaceAll(result, placeholder, value)
+	}
+
+	// Log a warning about missing secrets but continue with rendering
+	if len(missingSecrets) > 0 {
+		c.logf("Warning: %d secret(s) were not found and their placeholders remain: %v",
+			len(missingSecrets), missingSecrets)
 	}
 
 	// Write output file with secure permissions
@@ -535,7 +540,8 @@ func (c *Client) processTemplate(ctx context.Context, templatePath, outputPath s
 		return fmt.Errorf("failed to write output: %w", err)
 	}
 
-	c.logf("Successfully rendered template and wrote output to %s", outputPath)
+	c.logf("Successfully rendered template with %d/%d secrets and wrote output to %s",
+		len(values), len(variables), outputPath)
 	return nil
 }
 
