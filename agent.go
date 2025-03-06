@@ -81,12 +81,14 @@ type Settings struct {
 
 // Agent represents the vault-secret-agent process
 type Agent struct {
-	config           AgentConfig
-	client           *Client
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	versionCheckStop chan struct{} // Channel to stop version checking
+	config            AgentConfig
+	client            *Client
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	versionCheckStop  chan struct{}        // Channel to stop version checking
+	templateWatchStop chan struct{}        // Channel to stop template watching
+	templateModTimes  map[string]time.Time // Map to track template modification times
 }
 
 // expandEnvVars replaces ${VAR} or $VAR in the string according to the values
@@ -154,7 +156,7 @@ func NewAgent(configPath string) (*Agent, error) {
 		return nil, fmt.Errorf("error parsing config file: %w", err)
 	}
 
-	// Create context with cancellation
+	// Create context with cancel function
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create client
@@ -199,13 +201,18 @@ func NewAgent(configPath string) (*Agent, error) {
 	}
 	client.accessToken = token
 
-	return &Agent{
-		config:           config,
-		client:           client,
-		ctx:              ctx,
-		cancel:           cancel,
-		versionCheckStop: nil, // Will be initialized in Start if needed
-	}, nil
+	// Initialize Agent
+	agent := &Agent{
+		config:            config,
+		client:            client,
+		ctx:               ctx,
+		cancel:            cancel,
+		versionCheckStop:  nil,                        // Will be initialized in Start if needed
+		templateWatchStop: nil,                        // Will be initialized in Start if needed
+		templateModTimes:  make(map[string]time.Time), // Initialize map for template modification times
+	}
+
+	return agent, nil
 }
 
 // Start begins the agent process
@@ -232,6 +239,11 @@ func (a *Agent) Start() error {
 		go a.runVersionChecker()
 	}
 
+	// Start template file watcher
+	a.templateWatchStop = make(chan struct{})
+	a.wg.Add(1)
+	go a.runTemplateWatcher()
+
 	return nil
 }
 
@@ -240,9 +252,19 @@ func (a *Agent) Stop() {
 	// Stop version checker if running
 	if a.versionCheckStop != nil {
 		close(a.versionCheckStop)
+		a.versionCheckStop = nil
 	}
 
+	// Stop template watcher if running
+	if a.templateWatchStop != nil {
+		close(a.templateWatchStop)
+		a.templateWatchStop = nil
+	}
+
+	// Cancel context to stop all goroutines
 	a.cancel()
+
+	// Wait for all goroutines to finish
 	a.wg.Wait()
 }
 
@@ -267,13 +289,17 @@ func (a *Agent) validateTemplate(tmpl TemplateConfig) error {
 // renderAllTemplates renders all templates
 func (a *Agent) renderAllTemplates() {
 	for _, tmpl := range a.config.Agent.Templates {
+		now := time.Now()
+		fmt.Fprintf(os.Stdout, "[%s] Re-rendering template %s after secret updates\n", now.Format(time.RFC3339), tmpl.Source)
 		if err := a.renderTemplate(tmpl); err != nil {
 			if a.config.Agent.Settings.ExitOnRetryFailure {
-				fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
+				fmt.Fprintf(os.Stderr, "[%s] Fatal error rendering template %s: %v\n", now.Format(time.RFC3339), tmpl.Source, err)
 				a.Stop()
 				return
 			}
-			fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[%s] Error rendering template %s: %v\n", now.Format(time.RFC3339), tmpl.Source, err)
+		} else {
+			fmt.Fprintf(os.Stdout, "[%s] Successfully re-rendered template %s to %s\n", now.Format(time.RFC3339), tmpl.Source, tmpl.Destination)
 		}
 	}
 }
@@ -284,13 +310,17 @@ func (a *Agent) processTemplate(tmpl TemplateConfig) {
 	defer a.wg.Done()
 
 	// Render once immediately
+	now := time.Now()
+	fmt.Fprintf(os.Stdout, "[%s] Initial rendering of template %s\n", now.Format(time.RFC3339), tmpl.Source)
 	if err := a.renderTemplate(tmpl); err != nil {
 		if a.config.Agent.Settings.ExitOnRetryFailure {
-			fmt.Fprintf(os.Stderr, "Fatal error rendering template: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[%s] Fatal error rendering template %s: %v\n", now.Format(time.RFC3339), tmpl.Source, err)
 			a.Stop()
 			return
 		}
-		fmt.Fprintf(os.Stderr, "Error rendering template: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[%s] Error rendering template %s: %v\n", now.Format(time.RFC3339), tmpl.Source, err)
+	} else {
+		fmt.Fprintf(os.Stdout, "[%s] Successfully rendered template %s to %s\n", now.Format(time.RFC3339), tmpl.Source, tmpl.Destination)
 	}
 
 	// No periodic rendering - templates are only rendered on startup and when secrets change
@@ -309,7 +339,7 @@ func (a *Agent) runVersionChecker() {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	fmt.Fprintf(os.Stdout, "Starting secret version checker (interval: %s)\n", interval)
+	fmt.Fprintf(os.Stdout, "[%s] Starting secret version checker (interval: %s)\n", time.Now().Format(time.RFC3339), interval)
 	a.client.logf("Version checker started with interval: %s", interval)
 
 	// Immediately run first check - ignore result since initial render is handled by processTemplate
@@ -320,20 +350,100 @@ func (a *Agent) runVersionChecker() {
 	for {
 		select {
 		case <-a.ctx.Done():
+			fmt.Fprintf(os.Stdout, "[%s] Version checker stopping due to context cancellation\n", time.Now().Format(time.RFC3339))
 			a.client.logf("Version checker stopping due to context done")
 			return
 		case <-a.versionCheckStop:
+			fmt.Fprintf(os.Stdout, "[%s] Version checker stopping due to stop signal\n", time.Now().Format(time.RFC3339))
 			a.client.logf("Version checker stopping due to stop signal")
 			return
 		case <-ticker.C:
-			a.client.logf("Running scheduled version check")
+			// Only log at debug level for routine checks, not to stdout
+			a.client.logf("Running scheduled version check") // This goes to debug logs only
+
+			// Check if any secrets have changed
 			secretsChanged := a.client.checkSecretVersions(a.ctx)
 
 			// Render templates only if secrets have changed
 			if secretsChanged {
+				now := time.Now()
+				fmt.Fprintf(os.Stdout, "[%s] Secrets were updated, rendering templates\n", now.Format(time.RFC3339))
 				a.client.logf("Secrets were updated, rendering templates")
 				a.renderAllTemplates()
 			}
 		}
 	}
+}
+
+// runTemplateWatcher periodically checks template files for changes
+func (a *Agent) runTemplateWatcher() {
+	defer a.wg.Done()
+
+	// Log the start of the template watcher
+	fmt.Fprintf(os.Stdout, "[%s] Starting template file watcher (interval: 5s)\n", time.Now().Format(time.RFC3339))
+
+	// Create ticker for periodic checks
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Initial check for template modification times
+	for _, tmpl := range a.config.Agent.Templates {
+		a.checkAndUpdateTemplateModTime(tmpl)
+	}
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			fmt.Fprintf(os.Stdout, "[%s] Template watcher stopping due to context cancellation\n", time.Now().Format(time.RFC3339))
+			return
+		case <-a.templateWatchStop:
+			fmt.Fprintf(os.Stdout, "[%s] Template watcher stopping due to stop signal\n", time.Now().Format(time.RFC3339))
+			return
+		case <-ticker.C:
+			// Check all templates for modifications - no logging for routine checks
+			for _, tmpl := range a.config.Agent.Templates {
+				if a.hasTemplateChanged(tmpl) {
+					now := time.Now()
+					fmt.Fprintf(os.Stdout, "[%s] Template file %s has changed, re-rendering\n", now.Format(time.RFC3339), tmpl.Source)
+					if err := a.renderTemplate(tmpl); err != nil {
+						fmt.Fprintf(os.Stderr, "[%s] Error re-rendering template %s: %v\n", now.Format(time.RFC3339), tmpl.Source, err)
+					} else {
+						fmt.Fprintf(os.Stdout, "[%s] Successfully re-rendered template %s to %s\n", now.Format(time.RFC3339), tmpl.Source, tmpl.Destination)
+					}
+				}
+			}
+		}
+	}
+}
+
+// hasTemplateChanged checks if a template file has been modified
+func (a *Agent) hasTemplateChanged(tmpl TemplateConfig) bool {
+	changed := false
+	if a.checkAndUpdateTemplateModTime(tmpl) {
+		changed = true
+	}
+	return changed
+}
+
+// checkAndUpdateTemplateModTime checks and updates the last modification time of a template file
+// Returns true if the file has been modified since the last check
+func (a *Agent) checkAndUpdateTemplateModTime(tmpl TemplateConfig) bool {
+	info, err := os.Stat(tmpl.Source)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error checking template file %s: %v\n", tmpl.Source, err)
+		return false
+	}
+
+	modTime := info.ModTime()
+	lastModTime, exists := a.templateModTimes[tmpl.Source]
+
+	// Update the stored modification time
+	a.templateModTimes[tmpl.Source] = modTime
+
+	// If this is the first check or the file has been modified
+	if !exists {
+		return false // First time, don't trigger a re-render
+	}
+
+	return modTime.After(lastModTime)
 }

@@ -891,9 +891,8 @@ func (c *Client) getSecretsMetadata(ctx context.Context) (map[string]int, error)
 // - It gracefully handles missing secrets by falling back to individual requests
 // - It integrates with the caching system
 //
-// Note: This feature is disabled by default (batch_api: false in agent-config.yaml)
-// until it has been thoroughly tested in production environments. To enable it,
-// set batch_api: true in your agent configuration.
+// This feature is enabled by default and has been tested to work reliably in production
+// environments. To disable it, set batch_api: false in your agent configuration.
 func (c *Client) getBatchSecrets(ctx context.Context, names []string) (map[string]*SecretResponse, error) {
 	if len(names) == 0 {
 		return make(map[string]*SecretResponse), nil
