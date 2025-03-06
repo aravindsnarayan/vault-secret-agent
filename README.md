@@ -97,6 +97,7 @@ Run as a background service that automatically updates secrets:
          ttl: 86400s           # Cache TTL (24 hours)
          version_check: true   # Enable version checking
          version_check_interval: 10s  # Check versions every 10 seconds
+         batch_api: true        # Enable batch processing for multiple secrets
 
      logging:
        level: info
@@ -143,6 +144,7 @@ Run as a background service that automatically updates secrets:
     - `cache.ttl`: Cache lifetime for secrets
     - `cache.version_check`: Enable version checking to detect secret changes
     - `cache.version_check_interval`: How often to check for secret version changes
+    - `cache.batch_api`: Enable batch processing for multiple secrets
 
 - **Logging**:
   - Log level (debug, info, warn, error)
@@ -156,6 +158,36 @@ Run as a background service that automatically updates secrets:
 
 ## 🚀 Performance Optimizations
 
+The Vault Secret Agent includes several high-performance optimizations:
+
+### Secret Caching with TTL
+- Implements a thread-safe cache with configurable TTL
+- Automatically invalidates cache entries when secrets change
+- Dramatically reduces API calls in agent mode
+
+### Connection Pooling and HTTP Optimization
+- Configures optimal connection pool settings
+- Implements connection reuse with keep-alive
+- Optimizes compression settings for API communication
+
+### Batch Secret Processing
+- Retrieves multiple secrets in a single API call
+- Integrates with the caching system to only fetch cache misses
+- Includes fallback mechanisms for reliability
+- Implements pagination for handling large numbers of secrets
+
+### Automatic Template Re-rendering
+- Monitors template files for changes in real-time
+- Automatically re-renders templates when they change
+- Uses smart modification time tracking to prevent unnecessary renders
+- Provides timestamped logs for template change events
+
+### Optimized Logging
+- Reduces verbosity by only printing meaningful state changes
+- Includes ISO-8601 timestamps on all important log messages
+- Maintains detailed debug logs while keeping stdout clean
+- Improves log readability with consistent formatting
+
 ### Intelligent Template Rendering
 
 The agent uses an intelligent approach to template rendering:
@@ -163,6 +195,7 @@ The agent uses an intelligent approach to template rendering:
 1. **On-Demand Rendering**: Templates are only rendered:
    - When the agent starts
    - When a secret's value changes
+   - When a template file changes
 
 2. **Efficient Version Checking**:
    - Retrieves metadata for all secrets in a single API call (with pagination)
@@ -170,8 +203,9 @@ The agent uses an intelligent approach to template rendering:
    - Dramatically reduces API calls and resource usage
 
 3. **Configurable Settings**:
-   - Templates are rendered only on startup and when secrets change (no periodic rendering)
+   - Control caching behavior with `cache.ttl`
    - Adjust `version_check_interval` to control how frequently to check for secret changes
+   - Enable/disable batch processing with `cache.batch_api`
 
 This approach ensures that your applications always have the latest secrets while minimizing resource usage and API calls.
 
