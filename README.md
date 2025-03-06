@@ -133,8 +133,11 @@ Run as a background service that automatically updates secrets:
 ### Agent Configuration Options
 
 - **HCP Settings**:
-  - Authentication credentials
-  - Organization and project details
+  - Authentication credentials can be specified:
+    - Directly in the config file (values take precedence)
+    - As environment variables using `${VAR_NAME}` syntax (fallback)
+    - As environment variables without any config entry (final fallback)
+  - Supports all key HCP credentials: client_id, client_secret, organization_id, project_id, app_name
 
 - **Behavior Settings**:
   - `exit_on_retry_failure`: Whether to exit on repeated failures
@@ -231,4 +234,32 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🆘 Support
 
-For issues and feature requests, please create an issue in the repository. 
+For issues and feature requests, please create an issue in the repository.
+
+### Environment Variable Override Examples
+
+The agent supports three ways to configure credentials:
+
+1. **Direct Values in Config** (highest priority):
+   ```yaml
+   hcp:
+     client_id: "actual-client-id-here"  # Will use this exact value
+     organization_id: ${HCP_ORGANIZATION_ID}  # Will use env var
+   ```
+
+2. **Environment Variables via Placeholders**:
+   ```yaml
+   hcp:
+     client_id: ${HCP_CLIENT_ID}  # Will use env var HCP_CLIENT_ID
+   ```
+
+3. **Environment Variables Direct Fallback** (lowest priority):
+   ```yaml
+   hcp:
+     # client_id not specified - will use HCP_CLIENT_ID env var
+   ```
+
+This flexibility allows for:
+- Environment-specific configurations
+- Secure credential management
+- Easy local development and testing 

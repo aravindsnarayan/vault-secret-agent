@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -139,6 +140,17 @@ func isEnvVarChar(c byte) bool {
 	return c == '_' || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
+// getConfigValueWithEnvFallback returns the value from the config if non-empty,
+// otherwise returns the value from the environment variable
+func getConfigValueWithEnvFallback(configValue, envName string) string {
+	// If config value is empty or contains only env var placeholder, check environment
+	if configValue == "" || (strings.HasPrefix(configValue, "${") && strings.HasSuffix(configValue, "}")) {
+		return os.Getenv(envName)
+	}
+	// Otherwise return the config value (which might already have env vars expanded)
+	return configValue
+}
+
 // NewAgent creates a new agent from config file
 func NewAgent(configPath string) (*Agent, error) {
 	// Read config file
@@ -166,10 +178,10 @@ func NewAgent(configPath string) (*Agent, error) {
 		return nil, fmt.Errorf("error creating client: %w", err)
 	}
 
-	// Set client fields from config
-	client.orgID = config.Agent.HCP.OrganizationID
-	client.projectID = config.Agent.HCP.ProjectID
-	client.appName = config.Agent.HCP.AppName
+	// Set client fields from config, with environment variable fallbacks
+	client.orgID = getConfigValueWithEnvFallback(config.Agent.HCP.OrganizationID, "HCP_ORGANIZATION_ID")
+	client.projectID = getConfigValueWithEnvFallback(config.Agent.HCP.ProjectID, "HCP_PROJECT_ID")
+	client.appName = getConfigValueWithEnvFallback(config.Agent.HCP.AppName, "HCP_APP_NAME")
 
 	// Configure cache from settings
 	if config.Agent.Settings.Cache.Enabled {
@@ -193,8 +205,12 @@ func NewAgent(configPath string) (*Agent, error) {
 		client.logf("Secret caching disabled")
 	}
 
+	// Get client ID and secret with environment variable fallbacks
+	clientID := getConfigValueWithEnvFallback(config.Agent.HCP.ClientID, "HCP_CLIENT_ID")
+	clientSecret := getConfigValueWithEnvFallback(config.Agent.HCP.ClientSecret, "HCP_CLIENT_SECRET")
+
 	// Get initial access token
-	token, err := client.getAccessToken(config.Agent.HCP.ClientID, config.Agent.HCP.ClientSecret)
+	token, err := client.getAccessToken(clientID, clientSecret)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("error getting initial access token: %w", err)
